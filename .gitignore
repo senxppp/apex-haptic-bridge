@@ -1,0 +1,37 @@
+# ---- 本机配置（含绝对路径，绝不入库）----
+app.ini
+paths_local*
+
+# ---- 运行产物 ----
+*.log
+stats.log
+k5_probe.log
+k5slow.log
+diag.log
+app_error.log
+srv_out.log
+watchdog.log
+keepalive_console.log
+
+# ---- 构建产物 ----
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec
+
+# ---- 二进制与存档（走 Releases，不进仓库）----
+*.exe
+*.dll
+*.pdb
+*.zip
+*.7z
+backup-*/
+八爪鱼k5/
+
+# ---- 逆向材料与厂商资产（明确不发布）----
+_games/
+_re/
+ref_apex6/
+*.asar
+*.asar.unpacked

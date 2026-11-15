@@ -1,0 +1,17 @@
+; 复制本文件为 app.ini 后填入本机路径（app.ini 已在 .gitignore 里，不会被提交）
+; 四个读取方共用这一份：app.py / reload_chain.py / stop_chain.py / watchdog.py
+
+[paths]
+; usbip.exe —— 用来把虚拟手柄挂到本机。装 usbipd-win 或自行编译均可
+usbip = C:\path\to\usbip.exe
+
+; 飞智引擎（提供游戏音频 → 震动信号的解析）
+engine = C:\path\to\xHaptics Engine.exe
+engine_dir = C:\path\to
+
+; 可选：跑本项目用哪个 Python。留空=用当前解释器。
+; 只有当你需要另一个解释器（比如 hidapi 只装在那边）时才填
+python =
+
+; 可选：假游戏的宿主目录（让引擎认为有游戏在跑）。留空=仓库根目录
+fakegame =
