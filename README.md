@@ -8,6 +8,58 @@
 个人项目的工程存档：**逆向一个私有 USB 协议，然后用 160 条离线回归把它钉住**。
 仓库里只有我自己写的代码——不含任何厂商二进制、配置包或反编译产物，见文末[免责声明](#免责声明)。
 
+**中文** · [English](#english)
+
+预编译包（Windows x64）在 [Releases](https://github.com/senxppp/apex-haptic-bridge/releases)；
+`app.ini` 里的路径出厂留空，首次运行前要先填 `usbip` / `engine` / `engine_dir`。
+
+## English
+
+**apex-haptic-bridge** is a USB/IP device-impersonation bridge: it lets a proprietary
+audio-haptics engine — one that only talks to its own dongle — drive the motors and
+force-feedback triggers of another controller.
+
+The engine still does the hard part (audio capture, band weighting, transient detection,
+head/body/lock timing). This project only does **device translation** plus the stability
+work the engine does not do: attach a virtual controller, capture the engine's `0x57`
+real-time frames, throttle them to a safe write rate, and re-emit them as HID frames the
+local device accepts.
+
+| Stage | Owner |
+|---|---|
+| Audio → haptic envelope | vendor engine (unchanged) |
+| Engine → USB frames (`0x57`) | captured by the virtual device |
+| Frames → third-party HID writes | this project |
+| Freeze / hot-plug / reconnect recovery | this project |
+
+**Status** — second generation; supersedes
+[`gamepad-haptic-trigger-vibration-research`](https://github.com/senxppp/gamepad-haptic-trigger-vibration-research).
+160 offline regression tests; live-validated on one controller over USB.
+
+**What you install yourself**
+
+- Windows 10/11 x64
+- [`cezanne/usbip-win`](https://github.com/cezanne/usbip-win) — the
+  `usbip.exe attach -r <host> -b <busid>` client, **not** Microsoft's `usbipd-win`;
+  its driver may require test-signing (`bcdedit /set testsigning on`)
+- Vendor engine **5.0.2.8** (pinned to this frame layout)
+- Controller on USB (wireless untested); vendor background service stopped, otherwise it
+  grabs the device
+- `app.exe` launched as administrator
+
+**Download** — prebuilt binaries in
+[Releases](https://github.com/senxppp/apex-haptic-bridge/releases); `app.ini` ships with
+empty paths, fill them in before the first run.
+
+**License & disclaimer** — MIT for the code in this repository. No vendor binaries,
+firmware, configs, or decompiled artifacts are included or redistributed. Not affiliated
+with, authorized by, or endorsed by Flydigi or any other vendor; device identifiers and
+frame layouts are interoperability observations. You must own the hardware and software
+you use. Run at your own risk.
+
+---
+
+
 ## 项目状态：第二代
 
 本仓库是**当前版本**。上一代实现（自建音频引擎那套）留档在
