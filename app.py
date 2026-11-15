@@ -9,6 +9,7 @@
 #   修复 = 所有外部进程调用统一 CREATE_NO_WINDOW + 启动异常全部落盘 app_error.log，
 #   windowed 模式下不再出现 PyInstaller 的未捕获异常对话框。
 import configparser
+import ctypes
 import os
 import subprocess
 import sys
@@ -268,7 +269,49 @@ def start_hotplug():
         note("热插拔守护启动失败（不影响主链路）", e)
 
 
+def _single_instance():
+    """命名互斥体做单实例锁。
+
+    为什么必须有：14:4x 实测同时跑起来两套（两次双击 / 一次脚本一次双击），
+    后果不是"多一个窗口"这么简单——两个 server 各自拉起一个 k5_writer，
+    两条链路同时往同一个 dongle 写，实测写入量翻倍到 22~25 帧/s，
+    正好落进当年把引擎写超时、手柄冻结的区间。而且两份探针往同一个
+    k5_probe.log 追加，计数互相覆盖，界面读数会乱跳。
+
+    返回句柄（必须活到进程结束，否则锁会被释放）。
+    """
+    if os.name != "nt":
+        return True
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.CreateMutexW(None, False, "apex-haptic-bridge-singleton")
+        if not h:
+            return True                      # 拿不到锁就当没锁，别拦着人用
+        if ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS
+            return None
+        return h
+    except Exception:
+        return True
+
+
 def main():
+    # 单实例锁：已有实例在跑就不再起第二套（见 _single_instance 注释）
+    lock = _single_instance()
+    if lock is None:
+        note("已有一个实例在运行，本次启动退出（避免两条链路抢同一个设备）")
+        try:
+            msg = chr(10).join([
+                "已有一个实例在运行。",
+                "",
+                "同时开两个会让两条链路抢同一个接收器，写入量翻倍，",
+                "可能直接把震动写挂；界面读数也会乱跳。",
+                "",
+                "请回到任务栏里已有的那个窗口，或先运行 Stop-全链路.bat。",
+            ])
+            ctypes.windll.user32.MessageBoxW(None, msg, "haptics bridge", 0x40)
+        except Exception:
+            pass
+        return
     # 编排段整体兜底：任何一步失败都只记日志，不让 GUI 起不来、更不弹异常框
     try:
         server_start()

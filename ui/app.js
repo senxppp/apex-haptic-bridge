@@ -2,7 +2,7 @@
 const $ = (s) => document.querySelector(s);
 const api = () => window.pywebview?.api;
 
-const HIST = 240;                  // 折线保留点数（2Hz × 120 秒）
+const HIST = 240;                  // 折线保留点数（4Hz × 60 秒）
 const hist = { t: [], l: [], r: [] };
 const shown = { t: 0, l: 0, r: 0, w: 0, ms: 0 };
 const target = { t: 0, l: 0, r: 0, w: 0, ms: 0 };
@@ -10,9 +10,68 @@ const BUDGET = 12.5;               // 服务端写入上限（k5_min_iv = 0.08s�
 
 let muted = false, canvas, ctx, dpr = 1;
 
+// ---------- 参数表：界面由数据生成，加一个旋钮只改这里 ----------
+const SPEC = {
+  motor: [
+    { k: 'threshold', label: '噪声门限', min: 0, max: 20, step: 0.5, dec: 1,
+      desc: '低于它的声音不算震动' },
+    { k: 'strength', label: '震动强度', min: 0, max: 200, step: 1,
+      desc: '整体比例，100 = 原始' },
+    { k: 'boost_x', label: '转子增益', min: 0.5, max: 4, step: 0.1, dec: 1,
+      desc: 'k5 是偏心转子，比音圈更需要过驱才起转' },
+    { k: 'boost_add', label: '起转地板', min: 0, max: 200, step: 1,
+      desc: '非零电平直接抬到这里，补转子的启动死区' },
+    { k: 'hold_ms', label: '节拍保持', min: 0, max: 400, step: 10,
+      desc: '鼓点间隙不归零，避免一跳一跳' },
+    { k: 'pcm_gain', label: '音频增益', min: 100, max: 200, step: 1,
+      desc: '软膝曲线的斜率' },
+  ],
+  throttle: [
+    { k: 'k5_min_iv', label: '写入间隔', min: 0.05, max: 0.2, step: 0.005, ms: true,
+      desc: '越小越跟手，但接收器每次写会卡内核约 20ms' },
+    { k: 'k5_hard_iv', label: '最小硬间隔', min: 0.02, max: 0.08, step: 0.002, ms: true,
+      desc: '两帧之间的绝对下限，防背靠背把驱动写挂' },
+    { k: 'k5_jump_bypass', label: '抢发跳变', min: 0, max: 255, step: 5,
+      desc: '电平跳变超过它时立刻发一帧（打击起手），欠账随后偿还' },
+  ],
+  impact: [
+    { k: 'tr_p2_max', label: '冲击强度', min: 60, max: 255, step: 1 },
+    { k: 'tr_head_ms', label: '起振时长', min: 5, max: 80, step: 1,
+      desc: '越短越"点"，越长越"闷"' },
+    { k: 'tr_lockout_ms', label: '连打抑制', min: 20, max: 250, step: 5,
+      desc: '这段时间内不再起新的头' },
+    { k: 'tr_body_hold_ms', label: '余震保持', min: 0, max: 400, step: 10 },
+    { k: 'tr_release_ms', label: '释放时间', min: 60, max: 500, step: 10,
+      desc: '越大越"黏"' },
+    { k: 'tr_p3_min', label: '频率下限', min: 20, max: 120, step: 5 },
+    { k: 'tr_p3_max', label: '频率上限', min: 20, max: 120, step: 5 },
+    { k: 'tr_head_floor', label: '起振门限', min: 0, max: 120, step: 5,
+      desc: '低于它不判为打击' },
+    { k: 'tr_enable', type: 'switch', label: '冲击层',
+      desc: '关闭后扳机只剩阻尼' },
+  ],
+  damp: [
+    { k: 'tf_enable', type: 'switch', label: '阻尼层',
+      desc: '手指按在行程内才摸得到' },
+    { k: 'tf_max', label: '峰值力度', min: 20, max: 255, step: 1 },
+    { k: 'tf_base', label: '基线力度', min: 1, max: 60, step: 1,
+      desc: '静默时的常态阻力，1 = 最轻' },
+    { k: 'tf_attack_ms', label: '上升时间', min: 1, max: 80, step: 1 },
+    { k: 'tf_release_ms', label: '下降时间', min: 20, max: 600, step: 10,
+      desc: '比上升慢才有"惯性"' },
+  ],
+  legacy: [
+    { k: 'trig_burst', type: 'switch', label: '旧爆发',
+      desc: '固定时长的 mode 2，冲击层会接班' },
+    { k: 'trig_threshold', label: '触发门限', min: 0, max: 80, step: 1 },
+    { k: 'trig_burst_ms', label: '爆发时长', min: 60, max: 400, step: 10 },
+  ],
+};
+
 // ---------- 画布 ----------
 function sizeCanvas() {
   canvas = canvas || $('#wave');
+  if (!canvas) return;
   dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth, h = canvas.clientHeight;
   if (!w || !h) return;
@@ -51,6 +110,7 @@ function curve(key, color) {
 function draw() {
   if (!ctx) return;
   const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
   ctx.clearRect(0, 0, w, h);
   drawGrid(w, h);
   const peak = hist.t.length ? Math.max(...hist.t, ...hist.l, ...hist.r) : 0;
@@ -74,11 +134,12 @@ function tween(dt) {
     shown[key] += (target[key] - shown[key]) * k;
     if (Math.abs(target[key] - shown[key]) < .05) shown[key] = target[key];
   }
-  $('#v-t').textContent = Math.round(shown.t);
-  $('#v-l').textContent = Math.round(shown.l);
-  $('#v-r').textContent = Math.round(shown.r);
-  $('#v-w').textContent = shown.w.toFixed(1);
-  $('#v-ms').textContent = shown.ms.toFixed(2);
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('#v-t', Math.round(shown.t));
+  set('#v-l', Math.round(shown.l));
+  set('#v-r', Math.round(shown.r));
+  set('#v-w', shown.w.toFixed(1));
+  set('#v-ms', shown.ms.toFixed(2));
 }
 
 let lastT = performance.now();
@@ -92,6 +153,101 @@ function frame(now) {
   draw();
   lastT = now;
   requestAnimationFrame(frame);
+}
+
+// ---------- 参数面板 ----------
+function fmt(spec, v) {
+  if (spec.ms) return Math.round(Number(v) * 1000);
+  if (spec.dec) return Number(v).toFixed(spec.dec);
+  return Math.round(Number(v));
+}
+
+function buildParam(spec) {
+  const box = document.createElement('div');
+  if (spec.type === 'switch') {
+    box.className = 'switch';
+    box.dataset.key = spec.k;
+    box.innerHTML =
+      '<div><label>' + spec.label + '</label>' +
+      (spec.desc ? '<span class="sub">' + spec.desc + '</span>' : '') + '</div>' +
+      '<button class="tg" aria-pressed="false"><i></i></button>';
+    return box;
+  }
+  box.className = 'slider';
+  box.dataset.key = spec.k;
+  box.innerHTML =
+    '<label>' + spec.label + '<span class="val">—</span>' +
+    (spec.ms ? '<span class="ru"> ms</span>' : '') + '</label>' +
+    '<input type="range" min="' + spec.min + '" max="' + spec.max +
+    '" step="' + spec.step + '" value="' + spec.min + '">' +
+    (spec.desc ? '<span class="desc">' + spec.desc + '</span>' : '');
+  return box;
+}
+
+function buildAll() {
+  const map = { motor: '#params-motor', throttle: '#params-throttle',
+                impact: '#params-impact', damp: '#params-damp',
+                legacy: '#params-legacy' };
+  for (const [group, sel] of Object.entries(map)) {
+    const host = $(sel);
+    if (!host) continue;
+    host.textContent = '';
+    for (const spec of SPEC[group]) host.appendChild(buildParam(spec));
+  }
+}
+
+function bindParams() {
+  document.querySelectorAll('.params .slider').forEach((box) => {
+    const spec = findSpec(box.dataset.key);
+    const input = box.querySelector('input');
+    const val = box.querySelector('.val');
+    let timer = null;
+    const paint = () => { val.textContent = fmt(spec, input.value); };
+    paint();
+    input.addEventListener('input', () => {
+      paint();
+      clearTimeout(timer);
+      // 拖的时候只更新数字，停手 150ms 才写配置：一次拖动只落一版
+      timer = setTimeout(() => api()?.set_cfg(spec.k, Number(input.value)), 150);
+    });
+  });
+
+  document.querySelectorAll('.params .switch').forEach((box) => {
+    const spec = findSpec(box.dataset.key);
+    const tg = box.querySelector('.tg');
+    tg.addEventListener('click', async () => {
+      const next = tg.getAttribute('aria-pressed') !== 'true';
+      tg.setAttribute('aria-pressed', String(next));
+      await api()?.set_cfg(spec.k, next ? 1 : 0);
+      flash(spec.label + (next ? ' 已开启' : ' 已关闭'));
+    });
+  });
+}
+
+function findSpec(key) {
+  for (const list of Object.values(SPEC)) {
+    for (const s of list) if (s.k === key) return s;
+  }
+  return { k: key, dec: 0 };
+}
+
+function applyCfg(cfg) {
+  for (const list of Object.values(SPEC)) {
+    for (const spec of list) {
+      if (cfg[spec.k] === undefined) continue;
+      const box = document.querySelector('.params [data-key="' + spec.k + '"]')
+               || document.querySelector('[data-key="' + spec.k + '"]');
+      if (!box) continue;
+      const v = Number(cfg[spec.k]);
+      if (spec.type === 'switch') {
+        box.querySelector('.tg').setAttribute('aria-pressed', String(v === 1));
+      } else {
+        const input = box.querySelector('input');
+        input.value = String(v);
+        box.querySelector('.val').textContent = fmt(spec, v);
+      }
+    }
+  }
 }
 
 // ---------- 状态 ----------
@@ -110,8 +266,14 @@ async function poll() {
     target.r = s.channels?.[2] || 0;
     target.w = s.writes_per_s || 0;
     target.ms = s.avg_ms || 0;
-    hist.t.push(target.t); hist.l.push(target.l); hist.r.push(target.r);
-    for (const k of ['t', 'l', 'r']) if (hist[k].length > HIST) hist[k].shift();
+    // 只有探针真的出了新样本才入图：探针 10 次/秒、界面 4 次/秒轮询，
+    // 不去重会把同一帧记成好几个点，曲线看着像"卡住不动"。
+    const seq = s.seq ?? 0;
+    if (seq !== lastSeq) {
+      lastSeq = seq;
+      hist.t.push(target.t); hist.l.push(target.l); hist.r.push(target.r);
+      for (const k of ['t', 'l', 'r']) if (hist[k].length > HIST) hist[k].shift();
+    }
 
     $('#v-f').textContent = s.fails ?? 0;
     setLink(s.link_state, s.link_text || '未知');
@@ -120,6 +282,8 @@ async function poll() {
     tm.textContent = s.trig_mode || '常态';
     tm.className = 'hint' + (s.trig_mode === '冲击' ? ' hot' : '');
     if (s.trig_mode === '冲击') hit($('#v-t'));
+    const tstate = $('#trig-state');
+    if (tstate) tstate.textContent = s.trig_mode || '—';
 
     $('#st-line').textContent = s.status_line || '';
     $('#k-pid').textContent = s.engine_pid || '未运行';
@@ -150,33 +314,6 @@ function applyMute(on) {
 }
 
 // ---------- 交互 ----------
-function bindSliders() {
-  document.querySelectorAll('.slider').forEach((box) => {
-    const key = box.dataset.key;
-    const input = box.querySelector('input');
-    const val = box.querySelector('.val');
-    let timer = null;
-    input.addEventListener('input', () => {
-      val.textContent = input.value;
-      clearTimeout(timer);
-      timer = setTimeout(() => api()?.set_cfg(key, Number(input.value)), 150);
-    });
-  });
-}
-
-function bindSwitch() {
-  document.querySelectorAll('.switch').forEach((box) => {
-    const key = box.dataset.key;
-    const tg = box.querySelector('.tg');
-    tg.addEventListener('click', async () => {
-      const next = tg.getAttribute('aria-pressed') !== 'true';
-      tg.setAttribute('aria-pressed', String(next));
-      await api()?.set_cfg(key, next ? 1 : 0);
-      flash(next ? '阻尼层已开启：手指按在行程内可感到顶手' : '阻尼层已关闭');
-    });
-  });
-}
-
 function bindActions() {
   document.querySelectorAll('[data-act]').forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -206,6 +343,20 @@ function bindActions() {
   $('#btn-clear').addEventListener('click', () => { $('#log').textContent = ''; });
 }
 
+function bindTabs() {
+  document.querySelectorAll('.tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const view = tab.dataset.view;
+      document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('on', t === tab));
+      document.querySelectorAll('.view').forEach((v) => {
+        v.classList.toggle('on', v.dataset.view === view);
+      });
+      // 画布在隐藏视图里尺寸是 0，切回来必须重新量一次
+      if (view === 'monitor') { sizeCanvas(); }
+    });
+  });
+}
+
 const hitTimers = new WeakMap();
 function hit(el) {
   el.classList.add('hit');
@@ -214,8 +365,10 @@ function hit(el) {
 }
 
 let flashTimer = null;
+let lastSeq = -1;
 function flash(msg) {
   const n = $('#note');
+  if (!n) return;
   n.textContent = msg;
   n.style.color = 'var(--text)';
   clearTimeout(flashTimer);
@@ -227,24 +380,17 @@ function flash(msg) {
 
 // ---------- 启动 ----------
 window.addEventListener('pywebviewready', async () => {
+  buildAll();
+  bindParams();
+  bindActions();
+  bindTabs();
   sizeCanvas();
   const cfg = await api()?.cfg();
-  if (cfg) {
-    document.querySelectorAll('.slider').forEach((box) => {
-      const k = box.dataset.key;
-      if (cfg[k] === undefined) return;
-      const input = box.querySelector('input');
-      input.value = cfg[k];
-      box.querySelector('.val').textContent = cfg[k];
-    });
-    const tg = document.querySelector('.switch[data-key=tf_enable] .tg');
-    if (tg) tg.setAttribute('aria-pressed', String(Number(cfg.tf_enable) === 1));
-  }
-  bindSliders(); bindSwitch(); bindActions();
-  setInterval(poll, 500);
+  if (cfg) applyCfg(cfg);
+  setInterval(poll, 250);
   poll();
   requestAnimationFrame(frame);
 });
 
-window.addEventListener('resize', sizeCanvas);
+window.addEventListener('resize', () => { sizeCanvas(); });
 document.addEventListener('contextmenu', (e) => e.preventDefault());

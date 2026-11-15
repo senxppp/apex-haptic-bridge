@@ -104,7 +104,11 @@ class Api:
         self._recycler = recycler
         self._reloader = reloader
         self._log = collections.deque(maxlen=80)
-        self._prev = (None, None)      # (writes, t) 用于算写入速率
+        # 写入速率采样窗：探针写入是累计计数，任何时候都可能"一步跳好几帧"。
+        # 若直接用「上次调用到现在」的差值，0.5s 轮询撞上 1s 桶，会出现
+        # 0 与 24/s 交替（14:4x 用户看到"蹦到 22"就是这么来的）。
+        # 正确做法：留一秒以上的样本，用两端差值除以真实时间跨度。
+        self._wsamples = collections.deque(maxlen=40)
         self._last_frames = None
         self._last_mode = "常态"
         for m in (issues or []):
@@ -126,25 +130,57 @@ class Api:
             self.plog("读取 motor_config.json 失败")
             return {}
 
+    # 白名单 = (下限, 上限, 是否浮点)。范围写在这里，前端滑杆只是视图；
+    # 越界一律夹紧而不是拒绝——拖动滑杆时夹紧的体验比弹错误好。
+    SPEC = {
+        "threshold": (0, 20, True),
+        "strength": (0, 200, False),
+        "boost_x": (0.5, 4.0, True),
+        "boost_add": (0, 200, False),
+        "hold_ms": (0, 400, False),
+        "pcm_gain": (100, 200, False),
+        "k5_min_iv": (0.05, 0.20, True),
+        "k5_hard_iv": (0.02, 0.08, True),
+        "k5_jump_bypass": (0, 255, False),
+        "tr_enable": (0, 1, False),
+        "tr_p2_max": (60, 255, False),
+        "tr_head_ms": (5, 80, False),
+        "tr_lockout_ms": (20, 250, False),
+        "tr_body_hold_ms": (0, 400, False),
+        "tr_release_ms": (60, 500, False),
+        "tr_p3_min": (20, 120, False),
+        "tr_p3_max": (20, 120, False),
+        "tr_head_floor": (0, 120, False),
+        "tf_enable": (0, 1, False),
+        "tf_max": (20, 255, False),
+        "tf_base": (1, 60, False),
+        "tf_attack_ms": (1, 80, False),
+        "tf_release_ms": (20, 600, False),
+        "trig_burst": (0, 1, False),
+        "trig_threshold": (0, 80, False),
+        "trig_burst_ms": (60, 400, False),
+    }
+
     def set_cfg(self, key, value):
-        """只接受数值键，白名单外直接拒绝——避免前端手滑把整份配置写坏"""
-        allowed = {"tr_p2_max", "tr_head_ms", "tr_lockout_ms", "tr_release_ms",
-                   "tr_p3_min", "tr_p3_max", "tf_enable", "tf_max", "tf_base",
-                   "tr_enable", "threshold", "strength"}
-        if key not in allowed:
+        """只接受白名单内的数值键——避免前端手滑把整份配置写坏"""
+        if key not in self.SPEC:
             return {"ok": False, "message": "不支持的参数"}
+        lo, hi, is_float = self.SPEC[key]
         try:
-            v = int(value)
+            v = float(value) if is_float else int(round(float(value)))
         except Exception:
-            return {"ok": False, "message": "参数必须是整数"}
+            return {"ok": False, "message": "参数必须是数字"}
+        v = max(lo, min(hi, v))
+        if is_float:
+            v = round(v, 3)
         try:
             with open(CFG_PATH, "r", encoding="utf-8") as f:
                 cfg = json.load(f, object_pairs_hook=collections.OrderedDict)
             cfg[key] = v
             with open(CFG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=1)
-            self.plog("%s = %d（热加载约 1s）" % (key, v))
-            return {"ok": True, "message": "%s 已改为 %d" % (key, v)}
+            self.plog("%s = %s（热加载约 1s）" % (key, v))
+            return {"ok": True, "message": "%s 已改为 %s" % (key, v)}
         except Exception as e:
             self.plog("写配置失败: %r" % (e,))
             return {"ok": False, "message": "写配置失败"}
@@ -208,24 +244,34 @@ class Api:
         stats = _stats_line()
         writes = probe.get("writes") or 0
         now = time.time()
+        self._wsamples.append((now, writes))
+        while len(self._wsamples) > 2 and now - self._wsamples[0][0] > 3.0:
+            self._wsamples.popleft()
         w_per_s = 0.0
-        pw, pt = self._prev
-        if pw is not None and now - pt > 0.2:
-            w_per_s = max(0.0, (writes - pw) / (now - pt))
-        self._prev = (writes, now)
+        if len(self._wsamples) >= 2:
+            # 取「至少 1 秒前」的样本当基准；不足 1 秒就退而用最早的
+            base_t, base_w = self._wsamples[0]
+            for t, w in self._wsamples:
+                if now - t <= 1.0:
+                    break
+                base_t, base_w = t, w
+            span = now - base_t
+            if span >= 0.5:
+                w_per_s = max(0.0, (writes - base_w) / span)
 
+        # 瞬时电平：界面要跟着手感走，不能用周期峰值
         ch = probe.get("level") or [0, 0]
-        # 扳机通道不在 level 里（那是握把左右），从 trig_log 最后一条读模式
-        trig = probe.get("trig_log") or []
-        if trig:
-            last = trig[-1]
-            self._last_mode = "冲击" if "m2" in last else "常态"
+        # 扳机模式由探针持久记录（0x51 一到就更新），不再靠 trig_log 的
+        # 200ms 窗口去猜——那会让"冲击"只在命中那一刻闪一下。
+        tm = probe.get("trig_mode")
+        if tm is not None:
+            self._last_mode = "冲击" if int(tm) == 2 else ("常态" if int(tm) == 1 else "释放")
 
         age = now - os.path.getmtime(STATS) if os.path.exists(STATS) else 999
         pid = _engine_pid()
         if not pid:
             link_state, link_text = "bad", "引擎未运行"
-        elif age > 8:
+        elif age > 26:
             link_state, link_text = "warn", "流已静默 %s" % (
                 ">99s" if age > 99 else "%ds" % int(age))
         else:
@@ -258,7 +304,9 @@ class Api:
         self._last_frames = frames
 
         return {
-            "channels": [0, ch[0], ch[1]],
+            # seq：探针累计写数。前端拿它判"有没有新样本"，避免同一帧重复入图
+            "seq": writes,
+            "channels": [probe.get("trig_level") or 0, ch[0], ch[1]],
             "writes_per_s": round(w_per_s, 1),
             "fails": probe.get("fail", 0),
             "avg_ms": probe.get("avg_ms", 0.0),

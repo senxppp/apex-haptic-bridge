@@ -27,6 +27,13 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .ver{font-size:11px;color:var(--dim);letter-spacing:.05em;
      padding-left:11px;border-left:1px solid var(--line2)}
 .bar-right{display:flex;align-items:center;gap:10px}
+/* ---------- 页签 ---------- */
+.tabs{display:flex;gap:2px;padding:2px;border:1px solid var(--line);border-radius:8px;
+       background:var(--bg)}
+.tab{height:24px;padding:0 14px;border-radius:6px;font-size:11.5px;color:var(--dim);
+     transition:color .16s var(--ease),background .16s var(--ease)}
+.tab:hover{color:var(--muted)}
+.tab.on{background:var(--surface2);color:var(--text)}
 
 .pill{
   display:flex;align-items:center;gap:7px;height:28px;padding:0 12px;
@@ -57,14 +64,33 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 
 /* ---------- 网格 ---------- */
 main{
-  flex:1 1 auto; min-height:0;
-  display:grid; grid-template-columns:1fr 300px; gap:12px;
-  grid-template-rows:auto auto minmax(84px,1fr);
-  padding:12px 20px 0; align-content:stretch;
+  flex:1 1 auto; min-height:0; display:flex; flex-direction:column;
+  padding:12px 20px 0;
 }
+/* 视图切换：只显示带 .on 的那个，其余保持 display:none，不占布局 */
+.view{display:none; flex:1 1 auto; min-height:0; gap:12px}
+.view.on{display:grid}
+.view.on[data-view=monitor]{
+  grid-template-columns:1fr 300px;
+  grid-template-rows:auto minmax(120px,1fr);
+}
+.view.on[data-view=motor]{grid-template-columns:1fr 1fr; grid-template-rows:minmax(0,1fr)}
+.view.on[data-view=trigger]{grid-template-columns:1fr 1fr; grid-template-rows:minmax(0,1fr) minmax(0,1fr)}
 .chart-card{grid-column:1 / -1}
-.log-card{grid-column:1 / -1; display:flex; flex-direction:column; min-height:0}
+.log-card{display:flex; flex-direction:column; min-height:0}
 .side{display:flex; flex-direction:column; gap:12px; min-height:0}
+
+/* 参数视图：卡片内部滚动，窗口再小也不会把内容挤没 */
+.view.on[data-view=motor] .card,.view.on[data-view=trigger] .card{
+  display:flex; flex-direction:column; min-height:0; overflow:auto
+}
+.view.on[data-view=motor] .card::-webkit-scrollbar,
+.view.on[data-view=trigger] .card::-webkit-scrollbar{width:6px}
+.view.on[data-view=motor] .card::-webkit-scrollbar-thumb,
+.view.on[data-view=trigger] .card::-webkit-scrollbar-thumb{background:#22222a;border-radius:3px}
+.params{display:flex; flex-direction:column; gap:13px}
+.params .slider{margin-bottom:0}
+.desc{font-size:10.5px;color:var(--dim);margin-top:-2px;line-height:1.55}
 
 .card{
   background:var(--surface); border:1px solid var(--line); border-radius:10px;

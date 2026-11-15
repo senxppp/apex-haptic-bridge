@@ -349,6 +349,9 @@ CFG = {
                              #   管道背压堵死 urb 线程→引擎写超时弃权。旧稳定时代=控制台直打无此问题）
     "k5_min_iv": 0.08,       # k5 写入最小间隔秒。实锤：k5 USB（有线）驱动每次写卡内核 ~20ms（DPC），
                              # 27写/s 时引擎写超时挂起=冻结根因。0.08=12.5写/s（转子跟不上更快包络，无损）
+    "k5_hard_iv": 0.028,     # 两帧写入之间的绝对最小间隔（秒）。DPC 实测 ~20ms，
+                             # 28ms 留了余量：令牌桶可以攒额度，但不能背靠背连写。
+    "k5_jump_bypass": 70,    # 电平跳变超过这个值就抢发一帧（打击起手），欠账随后偿还。
     "k5_slow_write_ms": 5,   # 写进程 stdin 管道写耗时超过此值 = 子进程已堆积（DPC 卡住），
                              # 额外拉开一个 min_iv，避免尖刺后连续投喂（借鉴 VIIPER isoOutCompletionDeadline）
     "trig_burst": 1,         # 扳机爆发层（mode 2 鼓点打击）。释放路径已修（流断 2s 自动清零），
@@ -538,7 +541,22 @@ def decode_57(payload):
 
     def rms(vals):
         return (sum(v * v for v in vals) / len(vals)) ** 0.5
-    return _level_from_rms(rms(tv)), _level_from_rms(rms(lv)), _level_from_rms(rms(rv))
+
+    def lv1(vals):
+        """整包 RMS 给"稳"，最近两子帧给"快"。
+
+        一个 0x57 包 = 8 子帧 = 64ms 音频。只取整包 RMS 时，打击的起手会被
+        早先那几帧静音摊薄，听感上就是"慢半拍"。这里再算一次最后 16ms 的 RMS，
+        只有它明显更大（起手瞬间）才采纳—— sustain 段不受影响，不会被系统性抬高。
+        """
+        a = _level_from_rms(rms(vals))
+        if len(vals) >= 2:
+            b = _level_from_rms(rms(vals[-2:]))
+            if b > a * 1.15:
+                return b
+        return a
+
+    return lv1(tv), lv1(lv), lv1(rv)
 
 
 class K5:
@@ -568,7 +586,15 @@ class K5:
         self._trig_mode = 1         # 事实来源 = k5_writer 连接时设好的常态轻阻力(mode 1)
         self._fail_streak = 0
         self._last_send = 0.0       # 兼容保留（旧节流基准，已不再参与节拍）
-        self._next_send_at = 0.0    # 计划时刻：下一帧最早允许投喂的时刻（DPC 节流相位）
+        self._next_send_at = 0.0    # 兼容保留（已由令牌桶取代）
+        # 令牌桶（15:0x 改）：固定 80ms 间隔会把"打击的起手"整整压后一拍。
+        # 桶容量 1.6 允许空闲后立刻补两帧，欠账靠后续补水偿还，
+        # 长期速率仍是 1/min_iv（12.5 帧/s），不会漂到危险区。
+        self._tokens = 1.0
+        self._tok_at = 0.0
+        self._tok_cap = 1.6
+        self._last_write_at = 0.0
+        self._sent_level = (0, 0)
         self._level_now = (0, 0)    # 当前马达电平（安全归零监控用）
         self._last_rumble_ts = 0.0
         # 界面通道：静音状态 + 两次文件查询的时间戳（做缓存，别每帧 stat）
@@ -760,21 +786,40 @@ class K5:
                     pend = self._trig_q.pop(0)
             if pend is None:
                 continue
-            # DPC 节流（P1）：按「计划时刻」等待，绝不补偿性追赶。
-            # 旧版把 _last_send 记在 sleep 之前，sleep 的 80ms 被算进下一轮 elapsed，
-            # 于是「睡一轮 / 不睡一轮」交替 —— 离线实测 22.5 写/s（目标上限 12.5/s），
-            # 几乎命中战报里 27写/s 触发引擎写超时挂起的危险区。借鉴 VIIPER
-            # isoOutCompletionDeadline：落后超过一个周期就把相位重置为 now，放弃追赶。
+            # ---- DPC 节流（令牌桶版）----
+            # 旧版是硬性「每 80ms 一帧」：音源起手时，新电平最多要等满一个周期
+            # 才发出去，听感就是"慢半拍"。改成令牌桶后：
+            #   · 长期速率仍是 12.5 帧/s（1/min_iv），不碰 DPC 危险区
+            #   · 空闲攒下的令牌允许"立刻补一帧"，起手延迟从 ≤80ms 降到 ≤硬间隔
+            #   · 大跳变（打击）额外给一次抢发资格，欠账在后面几格里偿还
+            #   · 硬间隔（默认 28ms）永远生效，防两帧背靠背把驱动卡死
+            # 防御：离线回归用 K5.__new__ 造对象（不走 __init__），缺字段会让
+            # 写线程第一帧就抛 AttributeError 而死——三套用例同时挂就是这么来的。
+            if not hasattr(self, "_tokens"):
+                self._tokens, self._tok_at = 1.0, 0.0
+                self._tok_cap, self._last_write_at = 1.6, 0.0
+                self._sent_level = (0, 0)
             min_iv = CFG.get("k5_min_iv", self._k5_min_iv)
+            hard_iv = CFG.get("k5_hard_iv", 0.028)
             now = _t.time()
-            deadline = self._next_send_at
-            if deadline <= 0 or now - deadline > min_iv:
-                deadline = now
-                self._phase += 1
-            gap = deadline - now
-            if gap > 0:
-                _t.sleep(gap)
+            if self._tok_at <= 0:
+                self._tok_at = now
+            self._tokens = min(self._tok_cap,
+                               self._tokens + (now - self._tok_at) / max(min_iv, 0.02))
+            self._tok_at = now
+            jump = 0
+            if len(pend) > 6 and pend[3] == 0x12:
+                jump = max(abs(pend[5] - self._sent_level[0]),
+                           abs(pend[6] - self._sent_level[1]))
+            wait = hard_iv - (now - self._last_write_at)
+            allow_burst = jump >= CFG.get("k5_jump_bypass", 70)
+            if not allow_burst:
+                wait = max(wait, (1.0 - self._tokens) * min_iv)
+            if wait > 0:
+                _t.sleep(min(wait, 0.12))
                 self._throt += 1
+            # 欠账（抢发用掉的额度）允许为负，但最多欠一格
+            self._tokens = max(-1.0, self._tokens - 1.0)
             t0 = _t.time()
             n = self._k5_send(pend)
             cost = _t.time() - t0
@@ -782,16 +827,17 @@ class K5:
                 self.writes += 1
                 self._wq += 1
                 self._fail_streak = 0
-                # 下一帧计划时刻 = 本次写入完成 + min_iv（不累积追赶）
+                self._last_write_at = _t.time()
+                if len(pend) > 6 and pend[3] == 0x12:
+                    self._sent_level = (pend[5], pend[6])
                 slow_s = CFG.get("k5_slow_write_ms", self._SLOW_WRITE_MS) / 1000.0
-                self._next_send_at = _t.time() + min_iv
                 if cost > slow_s:
-                    # 管道背压 = 写进程那边已被 DPC 卡住，再拉一个周期别急着投喂
-                    self._next_send_at += min_iv
+                    # 管道背压 = 写进程那边已被 DPC 卡住，没收一格额度别急着投喂
+                    self._tokens -= 0.5
                     self._sloww += 1
             else:
                 self._wfail += 1
-                self._next_send_at = 0.0   # 失败快速重试，不背着旧相位
+                self._tokens = max(self._tokens, 0.6)   # 失败快速重试，但别打满
                 self._fail_streak += 1
                 # 0x51 是状态切换帧，去重 key 已记录，丢一帧就永远停在错误模式
                 # （扳机卡死）。失败时放回队首重发；0x12 电平帧下一帧会覆盖，无需留。

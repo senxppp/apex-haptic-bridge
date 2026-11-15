@@ -27,9 +27,20 @@ def write_probe(st):
     rec = {
         "ts": time.strftime("%H:%M:%S"), "writes": st["writes"],
         "ok": st["ok"], "fail": st["fail"],
-        # level 用「本刷新周期峰值」，不能用最后一帧：音频带节拍时最后一帧
-        # 几乎总是归零帧，会把满幅震动误报成「全程没震」（01:4x 实测踩过）。
-        "last_cmd": "0x%02X" % st["last_cmd"], "level": st["peak_level"],
+        # 两个值都要，因为它们回答的是不同问题：
+        #   level = 最后一帧（瞬时）→ 界面要跟手，必须用这个
+        #   peak  = 本刷新周期峰值 → 诊断"这段时间到底震没震"
+        # 14:4x 的教训：只记峰值（1s 一次）时，界面在整整一秒里都显示 255，
+        # 明明手感已经在掉，读数还钉在满幅。
+        "last_cmd": "0x%02X" % st["last_cmd"], "level": st["level"],
+        "peak": st["peak_level"],
+        # 扳机模式：0x51 一到就记，跨刷新周期保留——否则界面只能在
+        # 命中那一刻的 200ms 窗口里看到 m2，其余时间一律误报"常态"。
+        "trig_mode": st["trig_mode"], "trig_side": st["trig_side"],
+        # 扳机强度：mode2 时就是 p2（0..255），回落 mode1 即 0。
+        # 界面那条"扳机"曲线以前恒为 0（服务端根本没把 0x57 的 t 通道
+        # 写进探针），画出来是一条平线——14:4x 一并修掉。
+        "trig_level": st["trig_level"],
         "nz_period": st["nz_period"], "nz": st["nz"],
         "max_level": st["max_level"], "last_hex": st["last_hex"],
         # 0x51 扳机命令时间线：state-change 才发，必须单独记，否则被每秒
@@ -81,6 +92,7 @@ def main():
     st = {"writes": 0, "ok": 0, "fail": 0, "max_ms": 0.0, "sum_ms": 0.0,
           "last_cmd": 0, "level": [0, 0], "nz": 0, "max_level": [0, 0],
           "peak_level": [0, 0], "nz_period": 0, "trig_log": [],
+          "trig_mode": 0, "trig_side": 0, "trig_level": 0, "trig_at": 0.0,
           "last_hex": "", "last_flush": time.time()}
     stdin = sys.stdin.buffer
     while True:
@@ -118,6 +130,10 @@ def main():
             st["trig_log"].append("%s m%s/s%s f%s p%s,%s" % (
                 time.strftime("%H:%M:%S"), frame[7], frame[6],
                 frame[9], frame[10], frame[11]))
+            st["trig_mode"] = frame[7]
+            st["trig_side"] = frame[6]
+            st["trig_level"] = frame[10] if frame[7] == 2 else 0
+            st["trig_at"] = time.time()
         if len(frame) > 6 and frame[3] == 0x12:
             st["level"] = [frame[5], frame[6]]
             if frame[5] or frame[6]:
@@ -141,7 +157,11 @@ def main():
                 dev = None
                 streak = 0
         now = time.time()
-        if now - st["last_flush"] >= 1.0:
+        if st["trig_level"] and now - st["trig_at"] > 0.3:
+            st["trig_level"] = 0
+        # 0.1s：必须明显快于界面轮询（250ms），否则界面每次读到的都是
+        # 上一个桶里的旧值，看起来"慢半拍"；只记峰值时更糟——整整一秒钉在 255。
+        if now - st["last_flush"] >= 0.1:
             write_probe(st)
             st["last_flush"] = now
             st["peak_level"] = [0, 0]
