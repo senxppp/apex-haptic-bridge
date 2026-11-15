@@ -2,6 +2,12 @@
 
 # apex-haptic-bridge
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-2f81f7?style=flat-square)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-2f81f7?style=flat-square)](requirements.txt)
+[![Windows 11 x64](https://img.shields.io/badge/platform-Windows%2011%20x64-2f81f7?style=flat-square)](#兼容与实测)
+[![160 offline tests](https://img.shields.io/badge/tests-160%20offline-3fb950?style=flat-square)](#测试)
+[![USB/IP bridge](https://img.shields.io/badge/bridge-USB%2FIP-8957e5?style=flat-square)](#架构)
+
 > 把一个「只认自家手柄」的音频力反馈引擎，接到第三方手柄的马达和扳机上。
 > A USB/IP device impersonation bridge that translates a proprietary audio-haptics engine's output into another controller's motor/trigger frames.
 
