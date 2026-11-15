@@ -95,11 +95,9 @@ def main():
     ps("Get-CimInstance Win32_Process -Filter \"Name='crashpad_handler.exe'\" | "
        "Where-Object { -not (Get-Process -Id $_.ParentProcessId -EA SilentlyContinue) } | "
        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }")
-    log("2/8 停服务/代理/旧 XInput 探针（保留控制台和 watchdog）")
-    # 旧版不清 xinput_activity，每重载一次就多一个探针同时 XInputSetState 互相覆盖
+    log("2/8 停服务/代理（保留控制台和 watchdog）")
     ps("Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" | "
-       "Where-Object { $_.CommandLine -like '*usbip_apex6*' -or $_.CommandLine -like '*tcp_proxy*' "
-       "-or $_.CommandLine -like '*xinput_activity*' } | "
+       "Where-Object { $_.CommandLine -like '*usbip_apex6*' -or $_.CommandLine -like '*tcp_proxy*' } | "
        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
     time.sleep(1)
     log("3/8 摘除虚拟设备")
@@ -117,8 +115,11 @@ def main():
                        capture_output=True, text=True, errors="replace", timeout=60)
     log("   " + ((r.stdout or r.stderr or "")).strip()[:50])
     time.sleep(6)
-    log("6/9 启动 XInput 活动探针，等设备完全稳定 30 秒")
-    spawn("xinput_activity.py", FAKE, "xinput_activity_r.log")
+    # 这里原来会 spawn xinput_activity.py 模拟手柄活动，让引擎认为有输入。
+    # 该探针已废弃：现在由 usbip_apex6 在 bulk_in ep1 每 0.5s 注入一次 LT 半按
+    # （引擎需要的是"输入数据"，注入点更靠上游），XInput 探针反而会和真手柄抢
+    # XInputSetState。文件一直不存在，spawn() 本来就跳过，删除不改变行为。
+    log("6/9 等设备完全稳定 30 秒")
     time.sleep(30)
     log("7/9 启动官方引擎")
     if not ENGINE:

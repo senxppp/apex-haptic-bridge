@@ -127,28 +127,39 @@ def trig_frames(mod, extra=None):
 
 def main():
     results = []
+    skips = []
 
     def check(label, cond, detail=""):
         results.append((label, bool(cond), detail))
         print("%s %-58s %s" % ("[PASS]" if cond else "[FAIL]", label, detail))
+
+    def skip(label, why="缺对照基准"):
+        # 显式跳过，而不是写成 `old is None or ...` 那样恒真。
+        # 恒真断言会打印 [PASS]，等于把"没验证"伪装成"验证过"——这是本项目
+        # 最不能接受的一类假绿（2026-11-15 代码审计第 2 条）。
+        skips.append((label, why))
+        print("%s %-58s %s" % ("[SKIP]", label, why))
 
     old = load_old()
     body = bytes(v + 128 for v in (30, 60, 90, -30, -60, -90, 12, 24,
                                    36, 48, 60, 72, 84, 96, 108, 120,
                                    8, 16, 24, 32, 40, 48, 56, 64))
 
-    # --- 1. 正常路径零回归 ---
-    check("decode_57 输出与修复前一致",
-          old is None or old.decode_57(body) == new.decode_57(body),
-          str(new.decode_57(body)))
-    new_r = rumble_frame(new, 120, 80, NEW_EXTRA)
-    check("0x12 转子帧与修复前字节一致",
-          old is None or rumble_frame(old, 120, 80) == new_r,
-          str(new_r))
+    # --- 1. 正常路径零回归（与最初版本逐字节对照） ---
     new_t = trig_frames(new, NEW_EXTRA)
-    check("0x51 扳机帧与修复前字节一致",
-          old is None or trig_frames(old) == new_t,
-          "%d 帧" % len(new_t))
+    if old is None:
+        skip("decode_57 输出与修复前一致")
+        skip("0x12 转子帧与修复前字节一致")
+        skip("0x51 扳机帧与修复前字节一致")
+    else:
+        check("decode_57 输出与修复前一致",
+              old.decode_57(body) == new.decode_57(body),
+              str(new.decode_57(body)))
+        new_r = rumble_frame(new, 120, 80, NEW_EXTRA)
+        check("0x12 转子帧与修复前字节一致",
+              rumble_frame(old, 120, 80) == new_r, str(new_r))
+        check("0x51 扳机帧与修复前字节一致",
+              trig_frames(old) == new_t, "%d 帧" % len(new_t))
     check("0x51 帧校验和自洽",
           bool(new_t) and sum(new_t[0][2:31]) & 0xFF == new_t[0][31],
           "sum=%d ck=%d" % (sum(new_t[0][2:31]) & 0xFF, new_t[0][31]) if new_t else "")
@@ -201,14 +212,25 @@ def main():
     check("扳机 TTL 到期强制重发", len(k._trig_q) > 0)
 
     # --- 4. 写失败不丢 0x51 状态帧 ---
+    # 写线程是「弹出 → 等令牌 → 发送 → 失败回队」的循环，帧在队里的可见性有窗口：
+    # 直接 sleep 固定时长再断言会撞上"帧正在飞行中"的那一瞬（本用例 2026-11-15
+    # 就因此假失败过）。改成轮询到条件成立，最多等 1 秒。
+    def wait_until(pred, timeout=1.0, step=0.005):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if pred():
+                return True
+            time.sleep(step)
+        return False
+
     k = make(new, NEW_EXTRA)
     k._k5_send = lambda pend: 0
     tf = bytes(new.k5_force_trigger(1, 2, 0, 1, 130, 50))
     k._trig_q.append(tf)
     threading.Thread(target=k._writer, daemon=True).start()
-    time.sleep(0.15)
-    check("0x51 写失败回队重发", k._trig_q and bytes(k._trig_q[0]) == tf,
-          "队列 %d" % len(k._trig_q))
+    ok_back = wait_until(lambda: bool(k._trig_q) and bytes(k._trig_q[0]) == tf)
+    check("0x51 写失败回队重发", ok_back,
+          "队列 %d 失败 %d" % (len(k._trig_q), k._wfail))
 
     k2 = make(new, NEW_EXTRA)
     k2._k5_send = lambda pend: 0
@@ -243,7 +265,9 @@ def main():
     check("节流与投喂分类计数递增", kn._throt > 0 and kn._wq > 0,
           "节流=%d 投喂=%d 相位重置=%d" % (kn._throt, kn._wq, kn._phase))
     prev = load_prev()
-    if prev is not None:
+    if prev is None:
+        skip("上一轮版本确实超速率（节流相位回归对照实证）")
+    else:
         ko, rate_o = measure_rate(prev)
         check("上一轮版本确实超速率（节流相位回归对照实证）", rate_o > rate_n * 1.3,
               "上一轮 %.1f vs 本轮 %.1f 写/s" % (rate_o, rate_n))
@@ -285,11 +309,12 @@ def main():
           "dedup=%d" % kd._dedup_hits)
 
     bad = [r for r in results if not r[1]]
-    print("\n=== %d/%d PASS ===" % (len(results) - len(bad), len(results)))
-    if old is None:
-        print("注意：未找到最初版本，跳过字节级零回归对照")
-    if prev is None:
-        print("注意：未找到上一轮版本，跳过节流相位回归对照")
+    print("\n=== %d/%d PASS%s ===" % (len(results) - len(bad), len(results),
+                                     ("，%d SKIP" % len(skips)) if skips else ""))
+    if skips:
+        print("以下用例需要对照基准源码（未随仓库发布），本次未执行——不计入 PASS：")
+        for label, why in skips:
+            print("  - %s（%s）" % (label, why))
     return 1 if bad else 0
 
 

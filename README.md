@@ -5,13 +5,13 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f81f7?style=flat-square)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-2f81f7?style=flat-square)](requirements.txt)
 [![Windows 11 x64](https://img.shields.io/badge/platform-Windows%2011%20x64-2f81f7?style=flat-square)](#兼容与实测)
-[![160 offline tests](https://img.shields.io/badge/tests-160%20offline-3fb950?style=flat-square)](#测试)
+[![160 offline tests](https://img.shields.io/badge/tests-157%20offline-3fb950?style=flat-square)](#测试)
 [![USB/IP bridge](https://img.shields.io/badge/bridge-USB%2FIP-8957e5?style=flat-square)](#架构)
 
 > 把一个「只认自家手柄」的音频力反馈引擎，接到第三方手柄的马达和扳机上。
 > A USB/IP device impersonation bridge that translates a proprietary audio-haptics engine's output into another controller's motor/trigger frames.
 
-个人项目的工程存档：**逆向一个私有 USB 协议，然后用 160 条离线回归把它钉住**。
+个人项目的工程存档：**逆向一个私有 USB 协议，然后用 157 条离线回归把它钉住**。
 仓库里只有我自己写的代码——不含任何厂商二进制、配置包或反编译产物，见文末[免责声明](#免责声明)。
 
 **中文** · [English](#english)
@@ -40,7 +40,7 @@ local device accepts.
 
 **Status** — second generation; supersedes
 [`gamepad-haptic-trigger-vibration-research`](https://github.com/senxppp/gamepad-haptic-trigger-vibration-research).
-160 offline regression tests; live-validated on one controller over USB.
+157 offline regression tests (4 more need reference baselines and are skipped); live-validated on one controller over USB.
 
 **Compatibility** — Flydigi Apex 5 (k5) over USB, engine 5.0.2.8, Windows 11 x64. Wireless mode,
 other controller models and other engine versions are untested: the `0x57` frame layout and the
@@ -101,7 +101,7 @@ you use. Run at your own risk.
 | 我们负责 | 全链路（抓音 → 特征 → 映射 → 输出） | 只做**设备间翻译** + **稳定性** |
 | 接入方式 | 私有 HID 直发马达（`0xFFA0`） | USB/IP 虚拟设备，截引擎的 `0x57` 流 |
 | 适用硬件 | 上一代手柄 + DS 模式 | 新一代手柄 dongle |
-| 稳定性投入 | 基本没有 | 节流 / 停帧自愈 / 热插拔守护 / 160 条回归 |
+| 稳定性投入 | 基本没有 | 节流 / 停帧自愈 / 热插拔守护 / 157 条回归 |
 
 换成"让厂商引擎解析"不是退让：它的频段权重、瞬态检测、头/身/锁时序是调过的，
 自己重写一遍要花几个月还不如它。**把力气留在它不做的那部分**——翻译准、别卡死、别掉线。
@@ -315,17 +315,21 @@ for t in test_*.py; do python -I "$t"; done
 
 | 套件 | 条数 | 覆盖 |
 |---|---|---|
-| `test_vibe_chain.py` | 22 | 协议帧构造、0x57 解析、stats 格式串 |
+| `test_vibe_chain.py` | 19（+4 SKIP） | 协议帧构造、0x57 解析、stats 格式串 |
 | `test_hotplug.py` | 28 | 去抖 / 稳定期 / 冷却 / 自我触发排除 |
 | `test_frame_guard.py` | 32 | 停帧判定、来源选择、退避 |
 | `test_trigger_fallback.py` | 18 | 扳机回落（残响帧 / 队列插队 / 参数下限） |
 | `test_trig_force.py` | 27 | 包络 → 力、量化、写闸 |
 | `test_trig_rattle.py` | 25 | 头/身/锁时序、预算 |
 | `test_trig_wire.py` | 8 | **接线**：喂真 0x57 帧，断言"打击后不许立刻 rest" |
-| **合计** | **160** | |
+| `test_drift.py` | 9 | **引用完整性**：所有被 spawn / `python -I` 拉起的脚本是否真在仓库里 |
+| **合计** | **166** | 157 条业务回归 + 9 条仓库自洽 |
 
-> 仓库里 `test_vibe_chain.py` 比开发目录少 2 条：那两条是"与上一版对照"的实证用例，
-> 需要备份源码在场，开源版没有备份，自动跳过。
+> `test_vibe_chain.py` 里有 4 条需要历史版本源码做逐字节对照（"永久不震"bug 复现、
+> 节流相位回归、三类帧的零回归）。那两份基准含本机绝对路径，不随仓库发布，
+> 因此开源版把这 4 条标成 **SKIP 并打印原因**，不计入 PASS。早期版本写的是
+> `old is None or ...` 这样的恒真断言，缺基准也会打印 PASS，等于把"没验证"
+> 伪装成"验证过"，现已改掉。
 
 最后那套是踩坑换来的：渲染器刚把 mode 2 设上，`on_out` 里一条旧的"爆发到时回落"分支
 在下一帧就把它改回 mode 1，现象是日志里只剩一串 `m1 p0,0`、扳机完全不抖。
@@ -345,6 +349,7 @@ usbip_apex6.py       USB/IP 虚拟设备 + 0x57 解析 + 写入节流（核心�
 k5_writer.py         HID 写进程（独立 GIL 隔离，单点崩溃不影响服务端）
 frame_guard_core.py  停帧状态机（纯逻辑，可单测）
 auto_keepalive.py    停帧自愈守护
+quick_cycle.py       设备快速重连（独立进程，由守护/排障调用）
 hotplug_core.py      热插拔判定（纯逻辑）
 hotplug_reload.py    热插拔守护进程
 trig_force.py        包络 → 扳机阻尼力度
@@ -357,6 +362,7 @@ stop_chain.py        一键干净停止
 watchdog.py          引擎进程守护
 tcp_proxy2.py        端口转接
 docs/                设计文档
+test_drift.py        引用完整性自检（被 spawn 的脚本必须真存在）
 fakegame/            假游戏桩（让引擎认为有游戏在跑）
 ```
 
