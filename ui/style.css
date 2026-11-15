@@ -65,20 +65,62 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 /* ---------- 网格 ---------- */
 main{
   flex:1 1 auto; min-height:0; display:flex; flex-direction:column;
-  padding:12px 20px 0;
+  padding:12px 20px 0; overflow:hidden;
 }
 /* 视图切换：只显示带 .on 的那个，其余保持 display:none，不占布局 */
-.view{display:none; flex:1 1 auto; min-height:0; gap:12px}
+.view{
+  display:none; flex:1 1 auto; min-height:0; gap:12px;
+  /* 内容比窗口高的时候让滚轮生效：整块视图滚动，而不是被裁掉 */
+  overflow-y:auto; overflow-x:hidden;
+  padding-bottom:12px;
+}
 .view.on{display:grid}
+/* 细滚动条：默认那条 17px 的灰条会把深色界面割开一道口子 */
+.view::-webkit-scrollbar{width:8px}
+.view::-webkit-scrollbar-thumb{background:#24242c;border-radius:4px}
+.view::-webkit-scrollbar-thumb:hover{background:#32323c}
+.view::-webkit-scrollbar-track{background:transparent}
 .view.on[data-view=monitor]{
-  grid-template-columns:1fr 300px;
-  grid-template-rows:auto minmax(120px,1fr);
+  grid-template-columns:minmax(0,1fr) 300px;
+  grid-template-rows:auto minmax(140px,1fr);
 }
 .view.on[data-view=motor]{grid-template-columns:1fr 1fr; grid-template-rows:minmax(0,1fr)}
 .view.on[data-view=trigger]{grid-template-columns:1fr 1fr; grid-template-rows:minmax(0,1fr) minmax(0,1fr)}
 .chart-card{grid-column:1 / -1}
 .log-card{display:flex; flex-direction:column; min-height:0}
 .side{display:flex; flex-direction:column; gap:12px; min-height:0}
+
+/* ---------- 响应式 ---------- */
+/* 窗口变窄：右栏先让位给主区域，再整列堆叠 */
+@media (max-width:1080px){
+  .view.on[data-view=monitor]{grid-template-columns:minmax(0,1fr) 260px}
+  .budget-head,.kv{font-size:11px}
+}
+@media (max-width:940px){
+  .view.on[data-view=monitor]{
+    grid-template-columns:minmax(0,1fr);
+    grid-template-rows:auto auto minmax(150px,1fr);
+  }
+  .view.on[data-view=motor],
+  .view.on[data-view=trigger]{grid-template-columns:minmax(0,1fr); grid-template-rows:auto}
+  .view.on[data-view=motor] .card,
+  .view.on[data-view=trigger] .card{overflow:visible}
+  .reads{grid-template-columns:repeat(3,1fr); row-gap:10px}
+  .read:nth-child(4){border-left:0;padding-left:0}
+  .side{flex-direction:column}
+}
+/* 窗口变矮：折线让位，读数不换行 */
+@media (max-height:760px){
+  .canvas-wrap{height:88px}
+  #wave{height:88px}
+  .view.on[data-view=monitor]{grid-template-rows:auto minmax(96px,1fr)}
+}
+@media (max-height:640px){
+  .canvas-wrap{height:68px}
+  #wave{height:68px}
+  .bar{height:46px;flex-basis:46px}
+  .card{padding:10px 12px 11px}
+}
 
 /* 参数视图：卡片内部滚动，窗口再小也不会把内容挤没 */
 .view.on[data-view=motor] .card,.view.on[data-view=trigger] .card{

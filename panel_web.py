@@ -364,7 +364,7 @@ def run(recycler=None, reloader=None, issues=None):
     _dark_titlebar("haptics bridge")
     w = webview.create_window(
         "haptics bridge", url=index, js_api=api,
-        width=1040, height=812, min_size=(900, 640),
+        width=1040, height=812, min_size=(760, 560),
         background_color="#08080a", text_select=False, easy_drag=False,
     )
     webview.start(debug=False, http_server=False)
