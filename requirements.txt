@@ -1,3 +1,5 @@
 hidapi>=0.14.0
+# 界面（WebView2）。装不上不影响链路：app.py 会自动退回 Tk 面板
+pywebview>=5.0
 # 可选：只有需要自己打 exe 时才装
 # pyinstaller>=6.0

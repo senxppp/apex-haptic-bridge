@@ -23,6 +23,12 @@ if BASE not in sys.path:
 
 LOG = os.path.join(BASE, "keepalive.log")
 
+# 重定向到文件/管道时 Python 用系统代码页编码，日志里的中文会变乱码
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def log(msg):
     line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)

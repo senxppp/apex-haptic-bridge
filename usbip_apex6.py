@@ -312,6 +312,25 @@ def k5_trigger_rest(side):
 # ---- ApexSenseBridge 振动算法移植（0x57 -> k5 0x12）----
 # 参数由 motor_config.json 热加载（控制台程序可实时调节）
 CONFIG_PATH = os.path.join(_BASE, "motor_config.json")
+
+# ---- 界面通道（GUI 与设备层之间只走文件，不开 socket、不加锁竞争）----
+# mute.flag：存在即静音。写线程 1s 查一次，比每帧 stat 便宜得多。
+# cmd.txt  ：一次性命令，取走即删。zero=马达归零，buzz=强震约 2 秒。
+MUTE_FLAG = os.path.join(_BASE, "mute.flag")
+CMD_FILE = os.path.join(_BASE, "cmd.txt")
+
+
+def _take_cmd():
+    """取走一次性命令文件；没有就返回空串。"""
+    try:
+        if not os.path.exists(CMD_FILE):
+            return ""
+        with open(CMD_FILE, "r", encoding="utf-8", errors="replace") as f:
+            s = f.read().strip()
+        os.remove(CMD_FILE)
+        return s
+    except Exception:
+        return ""
 CFG = {
     "pcm_gain": 150,     # 100..200，quiet 音放大倍率
     "threshold": 3.0,    # int8 单位 RMS 门限（偏心转子保阈值）
@@ -552,6 +571,9 @@ class K5:
         self._next_send_at = 0.0    # 计划时刻：下一帧最早允许投喂的时刻（DPC 节流相位）
         self._level_now = (0, 0)    # 当前马达电平（安全归零监控用）
         self._last_rumble_ts = 0.0
+        # 界面通道：静音状态 + 两次文件查询的时间戳（做缓存，别每帧 stat）
+        self._mute = False
+        self._flag_t = [0.0, 0.0]
         # 扳机力包络（音频波形 → 阻尼力度）
         self._tf = (trig_force.ForceRenderer(lambda: CFG) if trig_force else None)
         self._tfg = (trig_force.WriteGate(lambda: CFG) if trig_force else None)
@@ -642,10 +664,54 @@ class K5:
         except Exception:
             return 0
 
+    def _poll_flags(self):
+        """静音与一次性命令。放在写线程里，天然串行，不会与 on_out 抢状态。
+
+        静音时要做两件事，少一件都"停不干净"：
+          1) 马达电平写零（0x12 是电平保持型，不写零会一直转）
+          2) 扳机从 mode 2 回落常态（否则冲击态会保持到下次切换）
+        """
+        now = _t.time()
+        # 防御：离线回归用 K5.__new__ 造对象，不走 __init__，没有这些字段
+        ft = getattr(self, "_flag_t", None)
+        if ft is None:
+            ft = self._flag_t = [0.0, 0.0]
+        if now - ft[0] >= 1.0:                    # 静音标记：1s 一次
+            ft[0] = now
+            self._mute = os.path.exists(MUTE_FLAG)
+        if getattr(self, "_mute", False):
+            if self._level_now != (0, 0):
+                self._level_now = (0, 0)
+                self._last = None
+                self._last_sent_at = 0.0
+                with self._pend_lock:
+                    self._pend = [0x03, 0x5A, 0xA5, 0x12, 0x04, 0, 0]
+            if self._trig_mode == 2:
+                self.trigger_rest()
+        if now - ft[1] >= 0.5:                    # 命令文件：0.5s 一次
+            ft[1] = now
+            cmd = _take_cmd()
+            if cmd == "zero":
+                self._level_now = (0, 0)
+                self._last = None
+                self._last_sent_at = 0.0
+                with self._pend_lock:
+                    self._pend = [0x03, 0x5A, 0xA5, 0x12, 0x04, 0, 0]
+                _dbg("[io] cmd zero")
+            elif cmd == "buzz":
+                # 强震靠"电平保持 + 2 秒安全归零"自然收尾，不额外计时
+                self._level_now = (255, 255)
+                self._last = (255, 255)
+                self._last_rumble_ts = now
+                with self._pend_lock:
+                    self._pend = [0x03, 0x5A, 0xA5, 0x12, 0x04, 255, 255]
+                _dbg("[io] cmd buzz")
+
     def _writer(self):
         """独立写线程：帧经 stdin 管道发往 k5 写进程 + 连续失败自动重启进程 + 流超时自动归零"""
         while True:
             _t.sleep(0.01)
+            self._poll_flags()
             # 安全归零：2 秒没收到新的 rumble 指令且马达非零 → 立刻归零
             # （0x12 是电平保持型，流断掉没人写零马达会永远转）
             if self._level_now != (0, 0) and _t.time() - self._last_rumble_ts > 2.0:
@@ -971,7 +1037,7 @@ class Apex6Virtual:
                 _STATS["lmax"] = max(_STATS.get("lmax", 0), l)
                 _STATS["rmax"] = max(_STATS.get("rmax", 0), r)
                 _STATS["kw"] = self.k5.writes if self.k5 else -1
-            if self.k5:
+            if self.k5 and not getattr(self.k5, "_mute", False):
                 # ---- 扳机 v4：常态化轻阻力底座 + 鼓点短暂爆发（爆发后回落底座，永不释放）----
                 # 事实来源 = k5._trig_mode。写入只发生在：强度档位变化、爆发→底座回落。
                 # 无音乐时保持底座阻力（永不 mode 0）——用户要求"常态+节奏时一起动"。

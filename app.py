@@ -124,6 +124,10 @@ def server_stop():
 
 
 def usbip_detach():
+    # 空路径直接跳过：subprocess.run(["", ...]) 抛的是 WinError 87（参数错误），
+    # 那句话对用户毫无意义——真正的原因是 app.ini 没填。14:35 实测踩到。
+    if not USBIP:
+        return
     try:
         subprocess.run([USBIP, "detach", "-p", "1"],
                        capture_output=True, timeout=30,
@@ -133,6 +137,8 @@ def usbip_detach():
 
 
 def usbip_attach():
+    if not USBIP:
+        return False
     try:
         r = subprocess.run([USBIP, "-t", "3241", "attach", "-r", "127.0.0.1", "-b", "1-1"],
                            capture_output=True, timeout=60,
@@ -157,6 +163,9 @@ def quick_cycle():
 
 
 def engine_start():
+    if not ENGINE:
+        note("未配置引擎路径，跳过启动")
+        return
     try:
         subprocess.Popen([ENGINE], cwd=ENGINE_DIR,
                          creationflags=NO_WINDOW)
@@ -274,16 +283,33 @@ def main():
     try:
         threading.Thread(target=keepalive_loop, daemon=True).start()
         start_hotplug()
-        import motor_panel
-        p = motor_panel.Panel(recycler=quick_cycle, reloader=reload_inline)
-        for msg in STARTUP_ISSUES:
-            p.plog("⚠ " + msg)
-        p.run()
+        run_panel()
     except Exception as e:
         note("GUI 启动失败", e)
     finally:
         # GUI 关闭 = 退出全部
         server_stop()
+
+
+def run_panel():
+    """优先 WebView2 网页界面；缺依赖或缺 ui/ 时退回 Tk 面板（能用就行，别黑屏）。
+
+    网页界面的价值全在手感：180ms 缓动、数字补间、折线动画，Tk 做不出来。
+    但它是可选增强——部署环境缺 WebView2 时不能连主链路一起废掉。
+    """
+    try:
+        import panel_web
+        panel_web.run(recycler=quick_cycle, reloader=reload_inline,
+                      issues=list(STARTUP_ISSUES))
+        return
+    except Exception as e:
+        note("网页界面不可用，退回 Tk 面板", e)
+
+    import motor_panel
+    p = motor_panel.Panel(recycler=quick_cycle, reloader=reload_inline)
+    for msg in STARTUP_ISSUES:
+        p.plog("⚠ " + msg)
+    p.run()
 
 
 if __name__ == "__main__":

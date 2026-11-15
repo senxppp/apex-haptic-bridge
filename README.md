@@ -190,6 +190,8 @@ m1 p0,0  ← 释放
 | `tr_lockout_ms` | 70 | 连打抑制（大 = 更克制） |
 | `tr_release_ms` | 220 | 余震长短（大 = 更"黏"） |
 | `tf_enable` | 0 | 阻尼层（"顶手"）开关 |
+| `mute.flag` | — | 存在即静音（界面「暂停震动」写它），服务端每秒检查 |
+| `cmd.txt` | — | 一次性命令：`zero` / `buzz`，取走即删 |
 | `k5_min_iv` | 0.08 | 硬件写入最小间隔（12.5 写/s） |
 
 ## 测试
@@ -237,6 +239,8 @@ hotplug_reload.py    热插拔守护进程
 trig_force.py        包络 → 扳机阻尼力度
 trig_rattle.py       包络 → 扳机抖动（头/身/锁/释放）
 app.py               GUI + 编排（打包入口）
+panel_web.py         控制台界面（WebView2 + HTML/CSS/JS）
+ui/                  界面资源：index.html / style.css / app.js
 reload_chain.py      一键重载（约 3 分钟）
 stop_chain.py        一键干净停止
 watchdog.py          引擎进程守护

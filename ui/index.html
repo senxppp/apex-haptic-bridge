@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>haptics bridge</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <span class="mark"></span>
+    <span class="title">haptics bridge</span>
+    <span class="ver">k5 / v9</span>
+  </div>
+  <div class="bar-right">
+    <div class="pill" id="link"><span class="dot"></span><span id="link-text">连接中</span></div>
+    <button class="btn mute" id="btn-mute"><span id="mute-label">暂停震动</span></button>
+  </div>
+</header>
+
+<main>
+  <section class="card chart-card">
+    <div class="card-head">
+      <h2>包络</h2>
+      <div class="legend">
+        <span><i class="k t"></i>扳机</span>
+        <span><i class="k l"></i>左握把</span>
+        <span><i class="k r"></i>右握把</span>
+      </div>
+    </div>
+    <div class="canvas-wrap"><canvas id="wave"></canvas></div>
+    <div class="reads">
+      <div class="read"><span class="rl">扳机</span><span class="rv" id="v-t">0</span></div>
+      <div class="read"><span class="rl">左握把</span><span class="rv" id="v-l">0</span></div>
+      <div class="read"><span class="rl">右握把</span><span class="rv" id="v-r">0</span></div>
+      <div class="read sep"><span class="rl">写入</span><span class="rv" id="v-w">0</span><span class="ru">次/秒</span></div>
+      <div class="read"><span class="rl">失败</span><span class="rv" id="v-f">0</span></div>
+      <div class="read"><span class="rl">耗时</span><span class="rv" id="v-ms">0</span><span class="ru">ms</span></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>扳机</h2><span class="hint" id="trig-mode">常态</span></div>
+    <div class="slider" data-key="tr_p2_max">
+      <label>冲击强度<span class="val">200</span></label>
+      <input type="range" min="60" max="255" value="200">
+    </div>
+    <div class="slider" data-key="tr_head_ms">
+      <label>起振时长<span class="val">30</span></label>
+      <input type="range" min="10" max="80" value="30">
+    </div>
+    <div class="slider" data-key="tr_lockout_ms">
+      <label>连打抑制<span class="val">70</span></label>
+      <input type="range" min="20" max="200" value="70">
+    </div>
+    <div class="slider" data-key="tr_release_ms">
+      <label>余震<span class="val">220</span></label>
+      <input type="range" min="80" max="500" value="220">
+    </div>
+    <div class="switch" data-key="tf_enable">
+      <div><label>阻尼层</label><span class="sub">手指在行程内才摸得到</span></div>
+      <button class="tg" aria-pressed="false"><i></i></button>
+    </div>
+  </section>
+
+  <div class="side">
+    <section class="card">
+      <div class="card-head"><h2>动作</h2></div>
+      <div class="actions">
+        <button class="btn" data-act="zero">马达归零</button>
+        <button class="btn" data-act="test">测试强震</button>
+        <button class="btn" data-act="recycle">设备重连</button>
+        <button class="btn" data-act="reload">重载全链路</button>
+      </div>
+      <p class="note" id="note">参数热加载，约 1 秒生效。</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>设备</h2></div>
+      <div class="kv"><span>引擎</span><b id="k-pid">—</b></div>
+      <div class="kv"><span>虚拟设备</span><b>37d7:2502</b></div>
+      <div class="kv"><span>握手</span><b id="k-link">—</b></div>
+      <div class="budget">
+        <div class="budget-head"><span>写入预算</span><b><i id="k-w">0</i> / 12.5</b></div>
+        <div class="meter"><i id="m-fill"></i></div>
+      </div>
+    </section>
+  </div>
+
+  <section class="card log-card">
+    <div class="card-head"><h2>日志</h2><button class="link" id="btn-clear">清空</button></div>
+    <pre class="log" id="log"></pre>
+  </section>
+</main>
+
+<footer class="foot"><span id="st-line">等待数据</span></footer>
+
+<script src="app.js"></script>
+</body>
+</html>
