@@ -9,8 +9,9 @@ usbip = C:\path\to\usbip.exe
 engine = C:\path\to\xHaptics Engine.exe
 engine_dir = C:\path\to
 
-; 可选：跑本项目用哪个 Python。留空=用当前解释器。
-; 只有当你需要另一个解释器（比如 hidapi 只装在那边）时才填
+; 子进程（服务端 / 写进程）用哪个 Python。留空 = 用拉起本程序的解释器。
+; ⚠ 这个解释器必须能 import hid，否则表现为"设备挂上了、但硬件一帧都写不进去"。
+; 装了多个 Python 时建议显式填，别指望 PATH 上那个就是对的。
 python =
 
 ; 可选：假游戏的宿主目录（让引擎认为有游戏在跑）。留空=仓库根目录

@@ -32,6 +32,7 @@ _SEEN_ISSUES = set()
 USBIP = ""
 ENGINE = ""
 ENGINE_DIR = ""
+PY = sys.executable
 STATS = os.path.join(BASE, "stats.log")
 SERVER_EXE = os.path.join(BASE, "server.exe")
 SERVER_PY = os.path.join(BASE, "usbip_apex6.py")
@@ -44,6 +45,9 @@ try:
         USBIP = _ini.get("paths", "usbip", fallback=USBIP)
         ENGINE = _ini.get("paths", "engine", fallback=ENGINE)
         ENGINE_DIR = _ini.get("paths", "engine_dir", fallback=ENGINE_DIR)
+        # 子进程用哪个解释器：必须能 import hid，否则服务端起来了但写不了硬件。
+        # GUI 可能被任意一个 Python 拉起（PATH 上的、双击关联的），不能信 sys.executable。
+        PY = (_ini.get("paths", "python", fallback="") or "").strip() or sys.executable
 except Exception as e:
     STARTUP_ISSUES.append("app.ini 读取失败: %r" % e)
 
@@ -91,10 +95,12 @@ def _server_cmd():
 
     仓库里只有源码，所以这条分支是默认路径。`-I` 隔离模式不把脚本目录放进
     sys.path，usbip_apex6.py 自己做了显式 insert（否则 trig_* 会静默导入失败）。
+    解释器一律取 app.ini 里配的那个：服务端要坚持同一个 Python，
+    否则会出现"设备挂上了但写不进硬件"（另一个解释器缺 hidapi）。
     """
     if os.path.exists(SERVER_EXE):
         return [SERVER_EXE]
-    return [sys.executable, "-I", SERVER_PY]
+    return [PY, "-I", SERVER_PY]
 
 
 def server_start():
