@@ -193,4 +193,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # 这个脚本没有参数：一执行就会拆掉整条链路。随手敲 --help 就真的开跑了，
+    # 2026-11-15 实测踩过一次（把刚起来的引擎和 watchdog 一起停了）。
+    if len(sys.argv) > 1:
+        print("用法: python -I reload_chain.py    （无参数；执行会重启整条链路，约 3 分钟）")
+        print("只想看配置是否就绪：python -c \"import reload_chain as r; print(r.USBIP, r.ENGINE, r.PY)\"")
+        sys.exit(64)
     sys.exit(main())
