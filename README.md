@@ -1,3 +1,5 @@
+<img src="assets/icon-1024.png" width="104" height="104" alt="apex-haptic-bridge">
+
 # apex-haptic-bridge
 
 > 把一个「只认自家手柄」的音频力反馈引擎，接到第三方手柄的马达和扳机上。
