@@ -17,9 +17,16 @@ def run(*args, **kwargs):
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
+# stdout 被重定向到管道/文件时，Python 会用系统代码页（cp936）编码。
+# 下游按 UTF-8 读就是一堆"ͣ����"。统一成 UTF-8，控制台和日志都干净。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def log(msg):
-    print(msg.encode("gbk", "replace").decode("gbk"), flush=True)
+    print(msg, flush=True)
 
 
 def _ini_paths():
