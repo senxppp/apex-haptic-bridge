@@ -36,6 +36,27 @@ local device accepts.
 [`gamepad-haptic-trigger-vibration-research`](https://github.com/senxppp/gamepad-haptic-trigger-vibration-research).
 160 offline regression tests; live-validated on one controller over USB.
 
+**Compatibility** — Flydigi Apex 5 (k5) over USB, engine 5.0.2.8, Windows 11 x64. Wireless mode,
+other controller models and other engine versions are untested: the `0x57` frame layout and the
+`0x51` trigger-mode semantics move with the engine version, so run `test_vibe_chain.py` after any
+upgrade — its byte-level comparison pinpoints exactly what changed.
+
+**Notes on the Flydigi ecosystem** (observations, not vendor material)
+
+- The engine does not tune per game: the `profiles/*.json` for Sekiro / Black Myth / Forza
+  Horizon 5 are byte-identical (`grip=h2_s2`, `trigger=trigger1`). Perceived differences come
+  from the audio itself — which is exactly why this project consumes audio only.
+- A trigger exposes three physical quantities: damping, rattle, lock. Among `mode 0..5` only
+  normal / racing-damping / machine-gun rattle / lock respond on this firmware; `mode 5`
+  (vibration) is a no-op.
+- Resistance "against the fingertip" exists only while the finger is inside the trigger travel,
+  so a damping-only mapping feels faint. Rattle is the main channel here; damping is layered on.
+- Audio is the only input: no game memory reads, no mods, no telemetry.
+
+If this saved you time, a star is appreciated; issues are easiest to fix when you paste the
+`判层=` lines from `stats.log`.
+
+
 **What you install yourself**
 
 - Windows 10/11 x64
@@ -82,6 +103,36 @@ you use. Run at your own risk.
 同生态的另一个项目：[`ds-unlock`](https://github.com/senxppp/ds-unlock)（DS 模式解锁，解决"能不能用上扳机"）。
 
 ---
+
+## 兼容与实测
+
+| 维度 | 已验证 | 未验证 |
+|---|---|---|
+| 手柄 | 飞智 八爪鱼 5（k5），USB 有线 | 无线 / 接收器模式；6Pro 等其它型号 |
+| 引擎 | xHaptics Engine **5.0.2.8**（x64） | 其它版本（帧布局可能变） |
+| 系统 | Windows 11 x64 | Windows 10；缺 WebView2 时退回 Tk 面板 |
+| 音源 | 系统回环：游戏、音乐、任意播放器 | 独占模式 / 虚拟声卡待测 |
+
+为什么锁死 5.0.2.8：`0x57` 实时帧的 8 子帧布局、`0x51` 的扳机模式语义都随版本走。
+换版本先跑 `test_vibe_chain.py`，字节级对照会直接告诉你哪一段变了。
+
+### 关于飞智（Flydigi）这套生态，实测到的事实
+
+这些是观察结果，用来解释「为什么某些手感调不出来」，不是从厂商拿到的技术资料，
+也不含任何厂商文件：
+
+- **引擎不为单个游戏调手感**。《只狼》《黑神话》《地平线 5》三份 `profiles/*.json`
+  逐字节相同，默认档都是 `grip=h2_s2` / `trigger=trigger1`。所以「换个游戏手感就变」
+  不来自引擎侧的游戏识别，而来自音频本身的差异——这也正是本项目只吃音频的原因。
+- **扳机只有三种物理量**：阻尼（顶手）、抖动、锁死。`mode 0..5` 里实测可用的是
+  常规 / 赛车阻尼 / 机枪抖动 / 锁；`mode 5`（震动）在本机固件上无响应，发了等于没发。
+- **「顶手」摸不到是物理原因**：阻尼只在手指压在行程内时存在，松开就没了。
+  所以纯阻尼方案体感很淡；本项目默认用抖动当主通道，阻尼只做叠加。
+- **音频是唯一输入**：不读游戏内存、不打 mod、不接遥测。厂商自己的遥测最终也是
+  转成同一路音频波形喂给引擎，绕开它没有收益。
+
+帧布局、模式语义、参数范围见 [`docs/trigger-protocol.md`](docs/trigger-protocol.md)，
+真机标定方法见 [`docs/real-device-calibration.md`](docs/real-device-calibration.md)。
 
 ## 它解决什么问题
 
@@ -302,6 +353,12 @@ tcp_proxy2.py        端口转接
 docs/                设计文档
 fakegame/            假游戏桩（让引擎认为有游戏在跑）
 ```
+
+## 如果它对你有用
+
+这类「逆向 + 稳定性」的项目，Star 是最直接的反馈；用上了、或者被某段实现帮到，
+都欢迎点一个。遇到问题请开 issue，把 `stats.log` 里带「判层=」的那几行贴上来，
+基本能一步定位到是引擎、桥、还是驱动那一层。
 
 ## 免责声明
 
