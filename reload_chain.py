@@ -63,6 +63,26 @@ def ps(cmd):
                    capture_output=True, text=True, errors="replace", timeout=60)
 
 
+def rotate_log(name, max_mb=20, keep=3):
+    """固定日志名 + 按大小轮转。
+
+    旧实现用 `server_v%d.log % (time%1000)`：每重载一次就新建一个文件，永不清理。
+    2026-11-20 实测：根目录堆了 380 个服务器日志、合计 14.7 GB（最大单个 2.2 GB），
+    把 C 盘吃到只剩 37 GB。名字里只有 time%1000，还会互相覆盖。
+    """
+    path = os.path.join(BASE, name)
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > max_mb * 1024 * 1024:
+            for i in range(keep - 1, 0, -1):
+                src, dst = "%s.%d" % (path, i), "%s.%d" % (path, i + 1)
+                if os.path.exists(src):
+                    os.replace(src, dst)
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    return name
+
+
 def spawn(script, cwd, logname):
     path = os.path.join(cwd, script) if cwd == BASE else script
     if not os.path.exists(path):
@@ -106,7 +126,7 @@ def main():
                    capture_output=True, timeout=30)
     time.sleep(1)
     log("4/8 启动服务端 + 代理")
-    spawn("usbip_apex6.py", BASE, "server_v%d.log" % int(time.time() % 1000))
+    spawn("usbip_apex6.py", BASE, rotate_log("server.log"))
     time.sleep(2)
     spawn("tcp_proxy2.py", BASE, "proxy_outN.log")
     time.sleep(1)
@@ -132,11 +152,9 @@ def main():
     newest = None
     for _ in range(60):
         time.sleep(1)
-        import glob
-        logs = sorted(glob.glob(os.path.join(BASE, "server_v*.log")), key=os.path.getmtime)
-        if not logs:
+        newest = os.path.join(BASE, "server.log")
+        if not os.path.exists(newest):
             continue
-        newest = logs[-1]
         try:
             with open(newest, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()

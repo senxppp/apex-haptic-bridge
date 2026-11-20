@@ -46,6 +46,15 @@ def test_sources():
     check("优先 k5_probe.log（1s 粒度）", src == "k5_probe.log" and abs(age - 1) < 0.01,
           (src, age))
     check("probe 源无阈值补偿", extra == 0.0)
+    # 回归（2026-11-20 实机复现）：探针是上一次运行留下的残骸，stats 才是这次运行的。
+    # 旧实现按表序返回第一个"存在"的文件 → 拿着 5 天前的 probe 判「停帧 999s」，
+    # 静默期（没音频就没写入，探针不落行）被当成故障，守护每 45s 摘挂一次设备。
+    os.utime(p2, (now - 999, now - 999))
+    os.utime(p, (now - 5, now - 5))
+    src, age, extra = fg.pick_source(fg.heartbeat_ages(d, now))
+    check("残骸探针不压过新鲜 stats（静默≠停帧）",
+          src == "stats.log" and abs(age - 5) < 0.01, (src, age))
+    os.utime(p2, (now - 1, now - 1))
     # frame_hb 出现则最高优先
     p3 = os.path.join(d, "frame_hb")
     open(p3, "w").write("")

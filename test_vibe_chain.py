@@ -292,6 +292,11 @@ def main():
     check("判层：第 3 层 dongle 写失败", "第3层" in new.flow_verdict(5, 0, 3, 0))
     check("判层：第 2 层全被去重挡下", "第2层" in new.flow_verdict(5, 0, 0, 9))
     check("判层：正常转发", new.flow_verdict(5, 7, 0, 9) == "正常转发")
+    # 2026-11-20 实机：残留 mute.flag 让"有信号不转发"被报成「无有效帧(检查引擎)」，
+    # 排查方向被带偏两轮。静音必须是独立判层，且优先级最高。
+    check("判层：静音开关优先于其它层",
+          new.flow_verdict(5, 0, 0, 0, muted=True) == "静音开关开启(mute.flag)",
+          new.flow_verdict(5, 0, 0, 0, muted=True))
     snap = dict(n=10, nz=6, ml=120, mr=90, kw=8)
     line = new.stats_line(snap, "正常转发",
                           dict(_wq=7, _wfail=0, _dedup_hits=9, _throt=7,

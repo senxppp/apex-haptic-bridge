@@ -317,6 +317,10 @@ CONFIG_PATH = os.path.join(_BASE, "motor_config.json")
 # mute.flag：存在即静音。写线程 1s 查一次，比每帧 stat 便宜得多。
 # cmd.txt  ：一次性命令，取走即删。zero=马达归零，buzz=强震约 2 秒。
 MUTE_FLAG = os.path.join(_BASE, "mute.flag")
+# 静音标记的残留寿命：界面的「暂停震动」是持久状态，但标记文件不该跨重启永久生效。
+# 2026-11-20 实机：15 号留下的 10 字节 mute.flag 让整条链路"有帧不出力"，
+# 排查两轮才定位；超过这个时长自动清除，并在 stats 判层里显式标注。
+MUTE_MAX_AGE = 8 * 3600
 CMD_FILE = os.path.join(_BASE, "cmd.txt")
 
 
@@ -433,13 +437,17 @@ _STATS = {"n": 0, "nz": 0, "ml": 0, "mr": 0, "kw": 0, "cfg": "", "maxlat": 0.0, 
 _STATS_LOCK = threading.Lock()
 
 
-def flow_verdict(d_nz, d_wq, d_wfail, d_dedup):
+def flow_verdict(d_nz, d_wq, d_wfail, d_dedup, muted=False):
     """三种「不震」判别法自动化：只看本周期的增量，给出故障所在层。
 
     层 1 引擎没出帧 / 全零帧；层 2 桥把帧全去重挡下；层 3 dongle 写失败。
     引擎完全静默时本函数不会被调用（stats.log 只在帧数变化时写，mtime 是
     auto_keepalive 的死亡判据，静默期绝不能补写）。
     """
+    if muted:
+        # 静音开关优先：此时"引擎有信号但不转发"是预期行为，不是故障。
+        # 旧版会落到兜底分支报"无有效帧(检查引擎)"，把排查往引擎方向带偏。
+        return "静音开关开启(mute.flag)"
     if d_nz <= 0:
         return "引擎有帧但全零(音源未点火)"
     if d_wfail > 0 and d_wq == 0:
@@ -504,7 +512,8 @@ def _stats_watcher():
             last_nz = snap["nz"]
             last_n = snap["n"]
             verdict = flow_verdict(d_nz, d.get("_wq", 0),
-                                  d.get("_wfail", 0), d.get("_dedup_hits", 0))
+                                  d.get("_wfail", 0), d.get("_dedup_hits", 0),
+                                  muted=os.path.exists(MUTE_FLAG))
             try:
                 with open(os.path.join(_BASE, "stats.log"), "a", encoding="utf-8") as f:
                     f.write(stats_line(snap, verdict, d, silence) + "\n")
@@ -705,6 +714,18 @@ class K5:
         if now - ft[0] >= 1.0:                    # 静音标记：1s 一次
             ft[0] = now
             self._mute = os.path.exists(MUTE_FLAG)
+            if self._mute:
+                # 残留自愈：标记可能是几小时前（甚至上次开机）留下的，界面上
+                # 不一定看得出，表现就是"全链路正常、手柄不震"。
+                try:
+                    _age = now - os.path.getmtime(MUTE_FLAG)
+                    if _age > MUTE_MAX_AGE:
+                        os.remove(MUTE_FLAG)
+                        self._mute = False
+                        print("[mute] 残留标记已 %.1fh，自动清除" % (_age / 3600.0),
+                              flush=True)
+                except OSError:
+                    pass
         if getattr(self, "_mute", False):
             if self._level_now != (0, 0):
                 self._level_now = (0, 0)

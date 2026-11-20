@@ -44,12 +44,26 @@ def heartbeat_ages(base, now=None):
 
 
 def pick_source(ages):
-    """选主心跳源。返回 (name, age, stall_extra)；全缺失 -> (None, inf, 0)。"""
+    """选主心跳源：按**新鲜度**选，不是按表序存在性。
+
+    旧实现返回表里第一个"存在"的文件，于是：`k5_probe.log` 是上一次运行留下的
+    残骸（5 天前的 mtime）、`stats.log` 是这次运行刚写的——它仍然选前者，
+    静默期（没有音频 → 没有写入 → 探针不落行）被判成"停帧 999s"，
+    守护每 45s 摘挂一次设备，而链路其实完全正常。2026-11-20 实机复现。
+
+    改成取 age 最小者：有写入时探针（0.1s 粒度）照旧胜出；没写入时自动降级到
+    stats.log（20s 粒度，阈值补偿 17s），静默不再等于故障。全缺失 -> (None, inf, 0)。
+    """
+    best = None
     for name, extra in SOURCES:
         age = ages.get(name)
-        if age is not None:
-            return name, age, extra
-    return None, float("inf"), 0.0
+        if age is None:
+            continue
+        if best is None or age < best[1]:
+            best = (name, age, extra)
+    if best is None:
+        return None, float("inf"), 0.0
+    return best
 
 
 class FrameState:
