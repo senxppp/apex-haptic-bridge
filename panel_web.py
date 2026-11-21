@@ -26,6 +26,19 @@ MUTE = os.path.join(BASE, "mute.flag")   # 服务端每秒看一次，存在=静
 CMD = os.path.join(BASE, "cmd.txt")      # 服务端每 0.5 秒看一次，取走即删
 
 
+def _budget_per_s():
+    """写入预算分母 = 1/k5_min_iv。
+    界面曾经写死 12.5：只要把 min_iv 调小（用户为了降延迟一定会调），读数就会
+    "长期超预算"，看着像链路故障，其实只是预算变宽了（2026-11-21 被这个误导过）。
+    """
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            iv = float(json.load(f).get("k5_min_iv", 0.08) or 0.08)
+    except Exception:
+        iv = 0.08
+    return round(1.0 / max(0.02, iv), 1)
+
+
 def _ui_dir():
     if getattr(sys, "frozen", False):
         for c in (os.path.join(getattr(sys, "_MEIPASS", ""), "ui"),
@@ -143,10 +156,20 @@ class Api:
         "k5_knee": (50, 254, False),
         "hold_ms": (0, 400, False),
         "pcm_gain": (100, 200, False),
-        "k5_min_iv": (0.05, 0.20, True),
+        "k5_min_iv": (0.03, 0.20, True),
         "k5_hard_iv": (0.02, 0.08, True),
         "k5_jump_bypass": (0, 255, False),
         "k5_jump_bypass_merged": (10, 255, False),
+        "k5_transient_k": (0.5, 8.0, True),
+        "k5_transient_floor": (0, 30, False),
+        "k5_ema_alpha": (0.005, 0.5, True),
+        "k5_transient_hold_ms": (0, 400, False),
+        # 2026-11-21：写入需求整形（死区分上升/下降）
+        "k5_dead_attack": (0, 60, False),
+        "k5_dead_release": (0, 80, False),
+        "k5_max_hold_ms": (50, 600, False),
+        "k5_tok_cap": (0.2, 2.0, True),
+        "k5_refresh_ms": (10, 400, False),
         "tr_enable": (0, 1, False),
         "tr_p2_max": (60, 255, False),
         "tr_head_ms": (5, 80, False),
@@ -313,6 +336,9 @@ class Api:
             "seq": writes,
             "channels": [probe.get("trig_level") or 0, ch[0], ch[1]],
             "writes_per_s": round(w_per_s, 1),
+            # 预算分母 = 1/k5_min_iv。界面写死 12.5，min_iv 一调小读数必然"超预算"，
+            # 看起来像 bug（2026-11-21 就是被这个误导的）。
+            "budget_per_s": _budget_per_s(),
             "fails": probe.get("fail", 0),
             "avg_ms": probe.get("avg_ms", 0.0),
             "link_state": link_state,

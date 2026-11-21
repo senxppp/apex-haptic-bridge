@@ -55,7 +55,7 @@
         <div class="kv"><span>虚拟设备</span><b>37d7:2502</b></div>
         <div class="kv"><span>握手</span><b id="k-link">—</b></div>
         <div class="budget">
-          <div class="budget-head"><span>写入预算</span><b><i id="k-w">0</i> / 12.5</b></div>
+          <div class="budget-head"><span>写入预算</span><b><i id="k-w">0</i> / <i id="k-b">12.5</i></b></div>
           <div class="meter"><i id="m-fill"></i></div>
         </div>
       </section>
@@ -89,8 +89,9 @@
         <div class="card-head"><h2>写入节流</h2><span class="hint">DPC 预算</span></div>
         <div class="params" id="params-throttle"></div>
         <p class="note">
-          接收器是有线 USB，每次写会让内核卡约 20 ms。间隔调小响应更快，
-          但太密会让引擎写超时、手柄冻结——12.5 次/秒是实测安全线。
+          上限 = 1 / <b>k5_min_iv</b>（当前配置 0.036 s → 约 28 次/秒），表头分母会自动跟着变。<br>
+          历史那条「12.5 次/秒安全线」是 k5 写还跑在主进程、HID 写会阻塞 urb 线程时代的推断；
+          写进程独立后前提不再成立——21 号实测 7 次/秒同样会断联，说明断联与写入率无关。
         </p>
       </section>
     </div>

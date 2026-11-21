@@ -6,7 +6,7 @@ const HIST = 240;                  // 折线保留点数（4Hz × 60 秒）
 const hist = { t: [], l: [], r: [] };
 const shown = { t: 0, l: 0, r: 0, w: 0, ms: 0 };
 const target = { t: 0, l: 0, r: 0, w: 0, ms: 0 };
-const BUDGET = 12.5;               // 服务端写入上限（k5_min_iv = 0.08s）
+let BUDGET = 12.5;                 // 服务端写入上限 = 1/k5_min_iv，默认 0.08s → 12.5 写/s
 
 let muted = false, canvas, ctx, dpr = 1;
 
@@ -29,6 +29,12 @@ const SPEC = {
       desc: '<1 中段更响，>1 中段更轻' },
     { k: 'k5_knee', label: '软限幅点', min: 50, max: 254, step: 1,
       desc: '超过它 tanh 压缩渐近 255，不再硬裁' },
+    { k: 'k5_transient_k', label: '瞬态灵敏度', min: 0.5, max: 8, step: 0.1, dec: 1,
+      desc: 'D3：起手判定 = 末两帧超出基线几倍"波动std"，越小越容易抓弱打击' },
+    { k: 'k5_transient_floor', label: '瞬态门限', min: 0, max: 30, step: 1,
+      desc: '起手判定的绝对下限（安静段 std≈0 时的兜底）' },
+    { k: 'k5_transient_hold_ms', label: '起手保持', min: 0, max: 400, step: 10,
+      desc: '命中后锁存电平的时长：挡住滑窗衰减瀑布，控写入预算（140 ≈ 一下鼓点 1~2 写）' },
     { k: 'hold_ms', label: '节拍保持', min: 0, max: 400, step: 10,
       desc: '鼓点间隙不归零，避免一跳一跳' },
     { k: 'pcm_gain', label: '音频增益', min: 100, max: 200, step: 1,
@@ -300,7 +306,12 @@ async function poll() {
     $('#k-link').textContent = s.handshake || '—';
 
     const rate = s.writes_per_s || 0;
+    // 分母跟着 k5_min_iv 走：写死 12.5 时，把 min_iv 调小以后表会一直红着，
+    // 看着像故障，其实只是预算变宽了（2026-11-21 读到 16~30 正是这个误读）。
+    if (s.budget_per_s) BUDGET = s.budget_per_s;
     $('#k-w').textContent = rate.toFixed(1);
+    const bl = $('#k-b');
+    if (bl) bl.textContent = BUDGET.toFixed(1);
     const fill = $('#m-fill');
     fill.style.width = Math.min(100, (rate / BUDGET) * 100) + '%';
     fill.classList.toggle('hi', rate > BUDGET * 0.9);

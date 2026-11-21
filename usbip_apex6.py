@@ -47,6 +47,11 @@ try:
 except Exception as _e:
     trig_rattle = None
     print("[cfg] trig_rattle 不可用（抖动 v2 关闭）: %r" % (_e,), flush=True)
+try:
+    import xinput_bridge           # 物理手柄真实输入 → 虚拟设备输入端点
+except Exception as _e:
+    xinput_bridge = None
+    print("[cfg] xinput_bridge 不可用（输入桥关闭，回落假半扣）: %r" % (_e,), flush=True)
 
 # 写进程是 console 程序；由 windowed 的 app.exe 链路启动时必须抑制控制台窗口
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -352,6 +357,12 @@ CFG = {
     "k5_gamma": 0.6,     # 幂曲线指数：<1 中段更响，=1 线性，>1 中段更轻
     "k5_knee": 215,      # 软限幅起点：高于此值 tanh 压缩渐近 255，替代 min(255) 硬裁
     "k5_jump_bypass_merged": 40,  # 合并模式的抢发阈值（起手电平 66~95；旧模式用 k5_jump_bypass=70）
+    # ---- D3 自适应瞬态（2026-11-21）：判据 = rb-ema > max(floor, k×移动std)，原始 RMS 域 ----
+    "k5_transient_adaptive": 1,  # 1=自适应（合并模式），0=退回固定 1.15× 比值
+    "k5_transient_k": 2.5,       # 移动 std 倍数：越大越保守（只抓真起手）
+    "k5_transient_floor": 3.0,   # 绝对门限（RMS 域）：静音开局 std≈0 时的兜底
+    "k5_ema_alpha": 0.04,        # 基线平滑：125/s 包率下时间常数 ≈200ms
+    "k5_transient_hold_ms": 140,  # 命中后闩锁快电平的时长（覆盖 64ms 衰减窗，防衰减瀑布）
     "hold_ms": 140,      # 转子保持时间
     "trig_threshold": 12,    # 扳机通道 t 激活门限（i8 有符号值）
     "trig_hold_ms": 300,     # t 归零后扳机效果保持时长
@@ -362,11 +373,46 @@ CFG = {
                              # 的根因，正确应答=治愈）。请求=5字节头(u16 len)，应答=3字节头(28B 恰满 32B 帧)。
     "debug_print": 0,        # 0=热路径静默（⚠ 16:xx 冻结元凶：print→重定向管道→PowerShell 写文件，
                              #   管道背压堵死 urb 线程→引擎写超时弃权。旧稳定时代=控制台直打无此问题）
-    "k5_min_iv": 0.08,       # k5 写入最小间隔秒。实锤：k5 USB（有线）驱动每次写卡内核 ~20ms（DPC），
-                             # 27写/s 时引擎写超时挂起=冻结根因。0.08=12.5写/s（转子跟不上更快包络，无损）
-    "k5_hard_iv": 0.028,     # 两帧写入之间的绝对最小间隔（秒）。DPC 实测 ~20ms，
-                             # 28ms 留了余量：令牌桶可以攒额度，但不能背靠背连写。
-    "k5_jump_bypass": 70,    # 电平跳变超过这个值就抢发一帧（打击起手），欠账随后偿还。
+    "k5_min_iv": 0.04,       # k5 写入长期平均间隔（秒）= 唯一速率旋钮。0.04 → 25 写/s。
+                             # 21 号实机结论：7 写/s 也会断联，说明断联与写入率无因果；
+                             # 12.5 反而把包络切得太粗（用户："没有之前舒适"）→ 放回 25。
+                             # 旧值 0.08 保留在此说明：那是"27 写/s = 冻结"时代的推断，作废。
+                             # 实锤：k5 USB（有线）驱动每次写卡内核 ~20ms（DPC），27 写/s 时
+                             # 引擎写超时挂起 = 冻结根因。⚠ 2026-11-21 探针实测：有声时旧代码
+                             # 平均 27.6 写/s、峰值 40 写/s —— 正好压在这条死线上（详见 _writer 注释）
+    "k5_hard_iv": 0.028,     # 两次写之间绝对最小间隔（秒）。DPC ~20ms，28ms 留余量。
+                             # 现在只作安全地板，不再是"绕过速率上限的通道"。
+    "k5_tok_cap": 1.0,       # 令牌桶容量（格）。1 格 = 空闲期最多攒出一次"立刻写"的资格。
+                             # 旧值 1.6 且允许欠账 = 长期速率可以超预算，等于没限。
+    "k5_jump_bypass": 70,    # 大跳变阈值：跳变 ≥ 此值时不参与死区合并，必须立刻发
+                             # （枪声尾巴那种断崖式下降只能靠它）。
+    # ---- 写入需求整形（2026-11-21）----
+    # 电平保持型设备 + ERM 转子有机械惯性：上升沿决定手感（必须快），下降沿落在
+    # 惯性里（可以合并）。预算 12.5 写/s 面对 125 帧/s 的滑窗，必须做取舍——
+    # 取舍点放在"听不出来的 1~2 点抖动"上，而不是让真正起手排队。
+    "k5_dead_attack": 4,     # 上升沿死区（映射后电平 0..255，相对上次入队值）
+    "k5_dead_release": 16,   # 下降沿死区：略大于上升沿（转子有惯性），但别太大——
+                             # 45 的实测手感是"台阶感"（用户："没有之前舒适"）
+    "input_bridge": 0,       # 1=把物理手柄的 XInput 真实输入桥进虚拟设备（2026-11-21 方案）
+                             # 0=旧的假半扣 LT（每 0.5s 半扣一次，仅用于保活）
+                             # 桥接成功时假半扣自动让位；桥找不到物理手柄则自动回落，不会更糟
+    "input_bridge_hz": 500,  # 桥的读取频率（XInputGetState 轮询；真实设备本身约 120 包/s）
+    "input_bridge_idle_ms": 400,  # 静止保活方波半周期（ms）：静止时 LT 在 0 与 kick_lt 之间
+                             # 各持续这么久交替。必须成**方波**而不是单次脉冲——
+                             # bulk_in 每秒上万次，单次脉冲只有 0.08ms，引擎 125Hz 采不到
+    "input_bridge_kick_lt": 40,   # 保活方波的高电平扳机量。**必须 >= 40**：引擎的"有人在"判据
+                             # 就是扳机量阈值，LT=6 不认、摇杆±1 不认、报告保留字节也不认
+                             # （四种都实测过）。40/255≈15.7%，压在多数游戏的扳机死区之下
+    "input_bridge_idle_after_ms": 2500,  # 松手多久之后才开始伪造扳机
+                             # 只在"全零静止"时才伪造：玩家推着摇杆/按着键时引擎绝不会超时，
+                             # 那会儿再伪造就是纯干扰（实测一轮 40% 时间 LT 被顶到 40 = 一直举枪）
+                             # 引擎约 10 秒收不到任何变化就停流（实测），所以这个必须 < 10s；
+                             # ±1/32768 会被游戏死区滤掉，不会造成漂移
+    "k5_refresh_ms": 120,    # 保活：电平稳定时也按此周期重发同一电平。
+                             # 21 号实机根因：低音量段电平稳定在 floor(60) 附近，死区把它
+                             # 全合并掉 → 只剩 1s 的 TTL 在喂 → 用户反馈"低音量没有震动"。
+                             # 设备是电平保持型，重发同一电平无副作用，代价 ≤8.3 写/s。
+    "k5_max_hold_ms": 200,   # 保留键（已被 k5_refresh_ms 取代，不再生效）
     "k5_slow_write_ms": 5,   # 写进程 stdin 管道写耗时超过此值 = 子进程已堆积（DPC 卡住），
                              # 额外拉开一个 min_iv，避免尖刺后连续投喂（借鉴 VIIPER isoOutCompletionDeadline）
     "trig_burst": 1,         # 扳机爆发层（mode 2 鼓点打击）。释放路径已修（流断 2s 自动清零），
@@ -447,6 +493,9 @@ def _cfg_watcher():
 
 
 _STATS = {"n": 0, "nz": 0, "ml": 0, "mr": 0, "kw": 0, "cfg": "", "maxlat": 0.0, "slow": 0}
+# 引擎是否已经真的开始发 0x57 帧（真输入接管的前置条件，见 _bridge_report）
+_ENGINE_SEEN = False
+
 _STATS_LOCK = threading.Lock()
 
 
@@ -563,6 +612,27 @@ def _level_from_rms(rms, rotor=False):
     return min(255, int(round(out127 * 255.0 / 127.0)))
 
 
+# ---- 0x57 通道状态（D2/D3，2026-11-21）：瞬态判据的自适应基线 ----
+# 引擎 0x57 包率 125/s（滑窗 8 子帧 = 64ms，每包推进 8ms）。l/r 各维护最近
+# _57_WIN 包的整包 RMS 环形缓冲 + EMA 基线：打击是否"起手"不再用固定 1.15×
+# 比值，而是 delta 相对移动 std（审计 §6.3：delta > k×std 抢发，阈值自适应）——
+# 静音开局 std≈0 由绝对门限兜底，嘈杂持续段 std 大自动抬高，弱打击不再被
+# 底噪淹没。只服务合并模式；t 通道与回滚模式保持旧 1.15 规则逐字节不变。
+# decode_57 只被 urb 线程调用（单写者），无锁；测试用 _57_reset() 归零。
+_57_WIN = 16
+_57_STATE = {"l": {"ring": [], "ema": 0.0, "hold_until": 0.0, "latched": 0},
+             "r": {"ring": [], "ema": 0.0, "hold_until": 0.0, "latched": 0}}
+
+
+def _57_reset():
+    """归零通道基线（测试隔离用；运行期不需要）"""
+    for st in _57_STATE.values():
+        st["ring"] = []
+        st["ema"] = 0.0
+        st["hold_until"] = 0.0
+        st["latched"] = 0
+
+
 def decode_57(payload):
     # 实测布局（无 flags 字节！）：24B = 8子帧×3B（trigger,left,right），第 25B 是填充
     # 线上编码 i8+128（0x80=0）。帧结构：[5A A5 57 len pkgCount][24样本+填充][checksum]
@@ -581,20 +651,63 @@ def decode_57(payload):
     def rms(vals):
         return (sum(v * v for v in vals) / len(vals)) ** 0.5
 
-    def lv1(vals, rotor=False):
+    def lv1(vals, rotor=False, ch=None):
         """整包 RMS 给"稳"，最近两子帧给"快"。
 
-        一个 0x57 包 = 8 子帧 = 64ms 音频。只取整包 RMS 时，打击的起手会被
-        早先那几帧静音摊薄，听感上就是"慢半拍"。这里再算一次最后 16ms 的 RMS，
-        只有它明显更大（起手瞬间）才采纳—— sustain 段不受影响，不会被系统性抬高。
+        一个 0x57 包 = 8 子帧 = 64ms 音频（包率 125/s 滑窗，每包推进 8ms）。只取
+        整包 RMS 时，打击的起手会被早先那几帧静音摊薄，听感上就是"慢半拍"。
+        这里再算一次最后 16ms 的 RMS，判定为"起手"才采纳——sustain 段不受影响。
+        "起手"判定按模式分三路：
+          - 合并模式 + k5_transient_adaptive=1（D3 自适应）：rb-ema >
+            max(k5_transient_floor, k5_transient_k×移动std)，全部在**原始 RMS 域**
+            （映射域带 floor，比值被压向 1，比例式会漏判——test_rotor_gain 判别体）。
+            基线判定后才更新，当前帧不污染自己的判据。
+          - 合并模式 + k5_transient_adaptive=0 或无通道状态：固定 1.15×（D1 过渡态）。
+          - 其余（t 通道 / 回滚模式）：固定 1.15×（旧版逐字节一致）。
         """
         a = _level_from_rms(rms(vals), rotor)
         if len(vals) >= 2:
             if rotor and CFG.get("k5_rotor_gain"):
-                # 转子合并模式：瞬态判定固定在原始 RMS 域（rb > ra*1.15）。
-                # 转子曲线带 floor，映射后比值被压缩，1.15 若在映射域比较会漏判起手。
-                # （旧路径保持映射域比较 = 旧版逐字节一致，扳机标定不受影响）
                 ra, rb = rms(vals), rms(vals[-2:])
+                st = _57_STATE.get(ch) if CFG.get("k5_transient_adaptive", 1) else None
+                if st is not None:
+                    now = _t.time()
+                    ema = st["ema"]
+                    ring = st["ring"]
+                    # 闩锁期（12-21 断联根修）：命中后 k5_transient_hold_ms 内返回锁存
+                    # 电平，衰减尾巴不再产生新电平——否则滑窗 8 包各给一个递减电平，
+                    # 每次打击 7~8 次写，音乐鼓点密集时写入率冲到 16/s，超 DPC 预算
+                    # （12.5/s 实测稳定线）→ 引擎写超时弃流 → 手柄反复断联。
+                    # 闩锁期间只更新基线，不做起手判定（鼓点间隔 <140ms 的第二下被
+                    # 掩盖是预算换来的，硬间隔与令牌桶仍然生效）。
+                    if now < st["hold_until"]:
+                        ring.append(ra)
+                        if len(ring) > _57_WIN:
+                            del ring[0]
+                        alpha = max(0.005, min(0.5, float(CFG.get("k5_ema_alpha", 0.04))))
+                        st["ema"] = ema + alpha * (ra - ema)
+                        latched = st["latched"]
+                        return latched if latched > a else a
+                    if len(ring) >= 4:
+                        mu = sum(ring) / len(ring)
+                        sd = (sum((x - mu) ** 2 for x in ring) / len(ring)) ** 0.5
+                    else:
+                        sd = 0.0
+                    hit = ((rb - ema) > max(float(CFG.get("k5_transient_floor", 3.0)),
+                                            float(CFG.get("k5_transient_k", 2.5)) * sd)
+                           and rb > ra)
+                    ring.append(ra)
+                    if len(ring) > _57_WIN:
+                        del ring[0]
+                    alpha = max(0.005, min(0.5, float(CFG.get("k5_ema_alpha", 0.04))))
+                    st["ema"] = ema + alpha * (ra - ema)
+                    if hit:
+                        b = _level_from_rms(rb, rotor)
+                        if b > a:
+                            st["hold_until"] = now + float(CFG.get("k5_transient_hold_ms", 140)) / 1000.0
+                            st["latched"] = b
+                            return b
+                    return a
                 if rb > ra * 1.15:
                     b = _level_from_rms(rb, rotor)
                     if b > a:
@@ -605,7 +718,7 @@ def decode_57(payload):
                     return b
         return a
 
-    return lv1(tv), lv1(lv, True), lv1(rv, True)
+    return lv1(tv), lv1(lv, True, "l"), lv1(rv, True, "r")
 
 
 class K5:
@@ -685,6 +798,10 @@ class K5:
         self._last_nz = (0.0, 0, 0)
         self._trig_mode = 1
         self._level_now = (0, 0)
+        # 去重基准换代（11-21：判据改用 _last + 死区）后必须同步复位：新写进程
+        # 会把设备重新 init（清电平），若基准还留着旧值，同电平会被一直去重掉。
+        self._sent_level = (0, 0)
+        self._prev_lv = None      # 上一帧电平（上升沿判据），新链路从零开始
         self._last_rumble_ts = _t.time()
         _tf = getattr(self, "_tfg", None)
         if _tf is not None:
@@ -847,44 +964,59 @@ class K5:
                     pend = self._trig_q.pop(0)
             if pend is None:
                 continue
-            # ---- DPC 节流（令牌桶版）----
-            # 旧版是硬性「每 80ms 一帧」：音源起手时，新电平最多要等满一个周期
-            # 才发出去，听感就是"慢半拍"。改成令牌桶后：
-            #   · 长期速率仍是 12.5 帧/s（1/min_iv），不碰 DPC 危险区
-            #   · 空闲攒下的令牌允许"立刻补一帧"，起手延迟从 ≤80ms 降到 ≤硬间隔
-            #   · 大跳变（打击）额外给一次抢发资格，欠账在后面几格里偿还
-            #   · 硬间隔（默认 28ms）永远生效，防两帧背靠背把驱动卡死
+            # ---- DPC 节流（令牌桶版，2026-11-21 修：桶必须是权威）----
+            # 历史：15:0x 加令牌桶是为了"起手别等满 80ms"。但旧实现里 allow_burst
+            # 直接跳过令牌检查、只受 hard_iv(28ms) 约束 —— 音频一响，几乎每帧都够得上
+            # "跳变"，节流形同虚设。2026-11-21 12:2x 用 k5_probe.log 复核：
+            #   有声窗口平均 27.6 写/s、峰值 4 写/100ms（=40 写/s = 1/hard_iv）
+            # 而 27 写/s 正是当年把引擎写超时、手柄冻结的那一档 —— 也就是说
+            # 界面上那张"写入预算"表长期只是个装饰，真实写入早就在危险区跑。
+            #
+            # 现在任何一次写都必须真的花掉一格额度：
+            #   · 额度只由"距上次写过去多久"累积，容量 1 格 = 最多抢发一帧
+            #   · 不许负欠账（欠账 = 长期速率可以超预算，等于没限）
+            #   · hard_iv 只作安全地板，不再是绕过预算的通道
+            # 起手不因此变慢：安静/节拍间隙会把额度攒满，起手那一帧照样立刻走；
+            # 预算紧张时靠 k5_dead_attack/release 把无效写入挡在入队之前（见 rumble）。
             # 防御：离线回归用 K5.__new__ 造对象（不走 __init__），缺字段会让
             # 写线程第一帧就抛 AttributeError 而死——三套用例同时挂就是这么来的。
             if not hasattr(self, "_tokens"):
                 self._tokens, self._tok_at = 1.0, 0.0
-                self._tok_cap, self._last_write_at = 1.6, 0.0
+                self._tok_cap, self._last_write_at = 1.0, 0.0
                 self._sent_level = (0, 0)
+            cap = float(CFG.get("k5_tok_cap", 1.0))
             min_iv = CFG.get("k5_min_iv", self._k5_min_iv)
+            span = max(min_iv, 0.02)
             hard_iv = CFG.get("k5_hard_iv", 0.028)
             now = _t.time()
             if self._tok_at <= 0:
                 self._tok_at = now
-            self._tokens = min(self._tok_cap,
-                               self._tokens + (now - self._tok_at) / max(min_iv, 0.02))
+            self._tokens = min(cap, self._tokens + (now - self._tok_at) / span)
             self._tok_at = now
-            jump = 0
+            jump_up = 0
             if len(pend) > 6 and pend[3] == 0x12:
-                jump = max(abs(pend[5] - self._sent_level[0]),
-                           abs(pend[6] - self._sent_level[1]))
-            wait = hard_iv - (now - self._last_write_at)
-            # 抢发阈值跟模式走（D1，2026-11-21）：合并曲线的起手电平（66~95）比
-            # 旧两级（95~117）低，70 会漏掉近半起手 → 排队等令牌桶（实测中位 +10ms）。
-            # 旧模式保持 70 不动，关掉合并增益 = 完整旧行为。
+                jump_up = max(pend[5] - self._sent_level[0],
+                              pend[6] - self._sent_level[1])
             burst_thr = (CFG.get("k5_jump_bypass_merged", 40) if CFG.get("k5_rotor_gain")
                          else CFG.get("k5_jump_bypass", 70))
-            allow_burst = jump >= burst_thr
-            if not allow_burst:
-                wait = max(wait, (1.0 - self._tokens) * min_iv)
+            # 起手可以"借一格"：额度刚好用尽时，起手不该再等一整格（那就是"慢半拍"）。
+            # 借用严格有界：同时只能欠一格，且额度攒回满格前不许再借 —— 长期速率不变。
+            onset = jump_up >= burst_thr
+            if self._tokens >= 1.0:
+                self._borrow = False
+            wait = hard_iv - (now - self._last_write_at)
+            if self._tokens < 1.0:
+                if onset and not getattr(self, "_borrow", False):
+                    self._borrow = True          # 借这一次，下面照常扣成负额度
+                else:
+                    wait = max(wait, (1.0 - self._tokens) * span)
             if wait > 0:
                 _t.sleep(min(wait, 0.12))
                 self._throt += 1
-            # 欠账（抢发用掉的额度）允许为负，但最多欠一格
+                # 睡掉的这段时间同样在攒额度，不结算就等于白睡一格
+                now = _t.time()
+                self._tokens = min(cap, self._tokens + (now - self._tok_at) / span)
+                self._tok_at = now
             self._tokens = max(-1.0, self._tokens - 1.0)
             t0 = _t.time()
             n = self._k5_send(pend)
@@ -939,10 +1071,38 @@ class K5:
                 high = min(255, int(high * CFG["boost_x"] + CFG["boost_add"]))
         self.boosted_max = max(self.boosted_max, low, high)
         self._last_rumble_ts = now  # 流活性信号（去重前刷新，防误归零）
-        # TTL 去重：写进程/设备状态失步时最多 TTL 秒就会强制重发一帧，自愈恢复震动
-        if (low, high) == self._last and (now - self._last_sent_at) < self._RUMBLE_TTL:
-            self._dedup_hits = getattr(self, "_dedup_hits", 0) + 1
-            return
+        # ---- 入队判据（2026-11-21 改）：死区分上升/下降，不再"完全相等才发" ----
+        # 为什么必须分：写入预算是硬约束（12.5 写/s），0x57 却是 125 帧/s 的滑窗，
+        # 电平几乎每帧都在动。旧判据"完全相等才去重"= 每帧都算新值 → 预算全烧在
+        # 1~2 点的抖动上，真起手反而排不上队（这正是"调到 0.03 才够快"的原因）。
+        # ERM 有机械惯性：上升沿决定手感（必须快），下降沿落在惯性里（可合并）。
+        base = self._last if self._last else (0, 0)
+        dl = low - base[0]
+        dr = high - base[1]
+        step = max(abs(dl), abs(dr))
+        # "上升沿"看的是**包络此刻在不在涨**（和上一帧比），不是"比上次写出的值高"。
+        # 差别很关键：连击时第二下峰值 238、第一下 245 —— 比上次写出的值低 7 点，
+        # 但包络明明刚从 120 冲上来。按旧判据会被 release 大死区合并掉，
+        # 转子不重新起转，连击听感就是"糊成一片"（21 号实测 184ms 那两拍就是它）。
+        prev = getattr(self, "_prev_lv", None) or base
+        rising = (low > prev[0]) or (high > prev[1])
+        self._prev_lv = (low, high)
+        dead = float(CFG.get("k5_dead_attack" if rising else "k5_dead_release",
+                             6 if rising else 22))
+        # 大跳变（断崖式下降，如枪声尾巴）不参与合并，必须立刻发
+        burst_thr = (CFG.get("k5_jump_bypass_merged", 40) if CFG.get("k5_rotor_gain")
+                     else CFG.get("k5_jump_bypass", 70))
+        if step >= burst_thr:
+            dead = 0.0
+        if step < dead:
+            idle = now - self._last_sent_at
+            # 非零电平：按 k5_refresh_ms 保活重发（低音量/长持续段靠它，否则转子停）。
+            # 零电平：只保留 _RUMBLE_TTL（1s）一次的兜底，不白白喂 0。
+            keep = (float(CFG.get("k5_refresh_ms", 120)) / 1000.0
+                    if (low or high) else self._RUMBLE_TTL)
+            if idle < keep:
+                self._dedup_hits = getattr(self, "_dedup_hits", 0) + 1
+                return
         self._last = (low, high)
         self._last_sent_at = now
         self._level_now = (low, high)
@@ -1140,6 +1300,10 @@ class Apex6Virtual:
                 print("[out #%d] 0x57 decode err: %r payload=%s" %
                       (self.reports, e, payload[:12].hex()), flush=True)
                 t, l, r = 0, 0, 0
+            _gap_s = _t.time() - _STATS.get("t57", 0.0)
+            if 0.5 < _gap_s < 600:
+                _diag("0x57 流恢复：中断 %.0fms" % (_gap_s * 1000.0))
+            _STATS["t57"] = _t.time()
             with _STATS_LOCK:
                 _STATS["n"] += 1
                 if l or r or t:
@@ -1304,11 +1468,39 @@ class Apex6Virtual:
         self.on_out(data, ep=ep)
         return 0, len(data)
 
+    def _bridge_report(self):
+        """物理手柄的真实输入（20B Xbox360 报告）；桥未启用/未就绪时返回 None。"""
+        global _ENGINE_SEEN
+        if xinput_bridge is None:
+            return None
+        # 冷启动闸门（2026-11-21 实测事故，务必保留）：
+        #   引擎 attach 的那一刻，如果输入端点返回的是一份**恒定不变**的报告
+        #   （真输入在没人碰手柄时就是全零），引擎不会进入流模式——此后 frames
+        #   永远为 0，只剩 client connected 在刷，整条链路等于假死。
+        #   而引擎**已经在流**的时候热切换到真输入，则完全正常（实测 125 帧/s 不变）。
+        # 所以顺序必须是：假半扣先撑着 → 看到引擎真的开始发 0x57 帧 → 再永久接管。
+        # 一旦接管就不再回退（防止引擎偶发抖动时来回切造成振荡）。
+        if not _ENGINE_SEEN and _STATS.get("n", 0) > 50:
+            _ENGINE_SEEN = True
+        if not _ENGINE_SEEN:
+            return None
+        try:
+            return xinput_bridge.current_report(CFG.get)
+        except Exception:
+            return None
+
     def bulk_in(self, ep, length):
         if ep == 0x01:  # MI_00 XInput IN (0x81)：xusb22 需要 20B Xbox360 格式报告
             # 虚拟 6Pro 输入数据注入（22:5x 用户澄清：引擎需要看到控制器有输入数据
             # 才保持活跃——没输入数据引擎就"不管"这台设备，扳机阻力等不恢复）。
             # 用 LT 扳机模拟量代替按键：每 0.5s 半扣一次（按键位=零，不干扰应用）。
+            # 优先：物理手柄真实输入（input_bridge=1 时）。字段与 XINPUT_GAMEPAD
+            # 一一对应，直填不换算；体感不在这里管（空间站/社区映射已把它变成摇杆）。
+            _br = self._bridge_report()
+            if _br:
+                return 0, _br
+            # 回落：假半扣。桥关掉、桥还没扫到物理手柄、或物理手柄拔了都会走到这里
+            # ——宁可"假扮有人"，也不能让这台设备看起来没人（引擎会因此不管它）。
             pressed = (int(_t.time() * 2) % 2) == 0
             rep = bytearray(20)
             rep[0], rep[1] = 0x00, 0x14

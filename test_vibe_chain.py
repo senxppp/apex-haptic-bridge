@@ -259,18 +259,120 @@ def main():
         stop[0] = True
         return k, (k.writes / elapsed if elapsed else 0)
 
+    # 上限跟着配置走（1/k5_min_iv），不再写死数字：21 号把 min_iv 从 0.08 放回 0.04
+    # （7 写/s 也断联 → 断联与写入率无因果；12.5 反而把包络切太粗，手感变差）。
+    _iv = float(new.CFG.get("k5_min_iv", 0.08))
+    _cap = 1.0 / _iv
+    _lim = _cap + 1.5          # 1 格借用的余量 + 计时抖动
     kn, rate_n = measure_rate(new)
-    check("节流后投喂率 <= 13.5 写/s（设计上限 12.5）", rate_n <= 13.5,
+    check("节流后投喂率 <= %.1f 写/s（设计上限 %.1f）" % (_lim, _cap), rate_n <= _lim,
           "%.1f 写/s" % rate_n)
     check("节流与投喂分类计数递增", kn._throt > 0 and kn._wq > 0,
           "节流=%d 投喂=%d 相位重置=%d" % (kn._throt, kn._wq, kn._phase))
-    prev = load_prev()
-    if prev is None:
-        skip("上一轮版本确实超速率（节流相位回归对照实证）")
-    else:
-        ko, rate_o = measure_rate(prev)
-        check("上一轮版本确实超速率（节流相位回归对照实证）", rate_o > rate_n * 1.3,
-              "上一轮 %.1f vs 本轮 %.1f 写/s" % (rate_o, rate_n))
+
+    # --- 5b. 有声场景：抢发不得绕过预算 ---
+    # 旧实现的 allow_burst 直接跳过令牌检查、只受 hard_iv(28ms) 约束，音频一响
+    # 就等价于 1/0.028 ≈ 35 写/s —— 界面那张"12.5 预算"表长期是装饰
+    # （2026-11-21 探针实测：有声平均 27.6 写/s、峰值 40 写/s）。
+    # 这里每 4ms 换一次大跳变，旧代码 100% 走抢发路径，新代码必须仍被限住。
+    def measure_rate_varying(mod, seconds=1.0, period=0.004):
+        k = make(mod, NEW_EXTRA)
+        k._last = None
+        stop = [False]
+        lv = [60]
+
+        def feed():
+            while not stop[0]:
+                lv[0] = 200 if lv[0] < 120 else 60
+                with k._pend_lock:
+                    k._pend = [0x03, 0x5A, 0xA5, 0x12, 0x04, lv[0], lv[0]]
+                time.sleep(period)
+
+        threading.Thread(target=feed, daemon=True).start()
+        threading.Thread(target=k._writer, daemon=True).start()
+        t0 = time.time()
+        time.sleep(seconds)
+        elapsed = time.time() - t0
+        stop[0] = True
+        return k, (k.writes / elapsed if elapsed else 0)
+
+    kv, rate_v = measure_rate_varying(new)
+    check("大跳变连发时投喂率仍 <= %.1f 写/s（抢发不得绕过预算）" % _lim, rate_v <= _lim,
+          "%.1f 写/s" % rate_v)
+
+    # --- 5c. 需求整形：小抖动不占预算，起手不能误伤 ---
+    # 死区作用在"映射/增益之后"的电平上，这里先把增益切到生产配置（motor_config.json
+    # 里 k5_rotor_gain=1），否则旧两级增益会把 105 顶成 255，判据无从验证。
+    _rg_save = new.CFG.get("k5_rotor_gain")
+    new.CFG["k5_rotor_gain"] = 1
+    kk = make(new, NEW_EXTRA)
+    nq = 0
+    for i in range(200):                      # 200 帧，电平只在 100±1 抖
+        kk.rumble(100 + (i % 3) - 1, 100)
+        if kk._pend:
+            nq += 1
+            kk._pend = None
+    check("±1 点抖动被死区合并（200 帧最多入队 1 次）", nq <= 1, "入队 %d 次" % nq)
+
+    ka = make(new, NEW_EXTRA)
+    ka._last = (100, 100)
+    ka._last_sent_at = time.time()
+    ka.rumble(112, 100)
+    check("起手 +12 不被下降沿大死区误伤", ka._pend is not None,
+          "pend=%r" % (ka._pend,))
+
+    kr = make(new, NEW_EXTRA)
+    kr._last = (120, 120)
+    kr._last_sent_at = time.time()
+    kr.rumble(105, 120)
+    check("缓降 -15 被下降沿死区合并", kr._pend is None, "pend=%r" % (kr._pend,))
+
+    kb = make(new, NEW_EXTRA)
+    kb._last = (200, 200)
+    kb._last_sent_at = time.time()
+    kb.rumble(60, 200)
+    check("断崖下降 -140 不受死区约束（必须立刻发）", kb._pend is not None,
+          "pend=%r" % (kb._pend,))
+
+    # 连击重打：第二下峰值 238 比第一下 245 低 7 点，但包络刚从 120 冲上来。
+    # 按"比上次写出的值高"判上升沿会被大死区吃掉 → 转子不重新起转 → 连击糊成一片。
+    kh = make(new, NEW_EXTRA)
+    kh._last = (245, 245)         # 上一拍已写出
+    kh._prev_lv = (120, 120)      # 这一帧包络在涨
+    kh._last_sent_at = time.time()
+    kh.rumble(238, 238)
+    check("连击重打（峰值略低但包络在涨）不被合并", kh._pend is not None,
+          "pend=%r" % (kh._pend,))
+
+    kz = make(new, NEW_EXTRA)
+    kz._last = (245, 245)
+    kz._prev_lv = (240, 240)      # 包络在跌
+    kz._last_sent_at = time.time()
+    kz.rumble(238, 238)
+    check("包络在跌时的 -7 点抖动被合并", kz._pend is None, "pend=%r" % (kz._pend,))
+
+    # 低音量保活：电平长期稳定在 floor 附近时，死区会把所有帧合并掉 → 只剩 1s 的 TTL，
+    # 转子就停了（21 号实机反馈"低音量没有震动"）。必须按 k5_refresh_ms 重发同一电平。
+    kp = make(new, NEW_EXTRA)
+    kp._last = (60, 60)
+    kp._last_sent_at = time.time() - 0.30
+    kp.rumble(60, 60)
+    check("电平不变但超过 refresh_ms → 保活重发", kp._pend is not None,
+          "pend=%r" % (kp._pend,))
+
+    kq = make(new, NEW_EXTRA)
+    kq._last = (60, 60)
+    kq._last_sent_at = time.time() - 0.03
+    kq.rumble(60, 60)
+    check("refresh_ms 窗口内不重复喂", kq._pend is None, "pend=%r" % (kq._pend,))
+
+    # 零电平不进保活：静音时不该每 120ms 喂一个 0（只保留 1s 的 TTL 兜底）
+    k0 = make(new, NEW_EXTRA)
+    k0._last = (0, 0)
+    k0._last_sent_at = time.time() - 0.30
+    k0.rumble(0, 0)
+    check("静音不按 refresh_ms 喂零", k0._pend is None, "pend=%r" % (k0._pend,))
+    new.CFG["k5_rotor_gain"] = _rg_save
 
     # --- 6. 慢写保护：管道背压时额外拉开一个周期 ---
     ks = make(new, NEW_EXTRA)
@@ -312,6 +414,137 @@ def main():
     kd.rumble(120, 80)
     check("去重命中被计入分类统计", kd._dedup_hits == 1,
           "dedup=%d" % kd._dedup_hits)
+
+    # --- 9. 输入桥：XINPUT_GAMEPAD → 20B Xbox360 报告的字段位置 ---
+    # 这段是纯函数，钉住字节位置就等于钉住了"引擎/游戏看到的输入"，
+    # 比"跑起来看起来能动"可靠（后者在没人碰手柄时永远是 0，验不出错位）。
+    import xinput_bridge as xb
+    r0 = xb.to_report((0x0000, 0, 0, 0, 0, 0, 0))
+    check("零状态报告 = 00 14 后全零（共 20B）",
+          r0[:2] == b"\x00\x14" and r0[2:] == bytes(18) and len(r0) == 20,
+          r0.hex())
+
+    rb = xb.to_report((0x1234, 200, 100, 0, 0, 0, 0))
+    check("按键低/高字节在 [2]/[3]（小端）",
+          rb[2] == 0x34 and rb[3] == 0x12 and rb[4] == 200 and rb[5] == 100,
+          rb[:6].hex())
+
+    rl = xb.to_report((0, 0, 0, -32768, 32767, -1, 40000))
+    check("摇杆有符号小端：LX=-32768 → 00 80", rl[6] == 0x00 and rl[7] == 0x80,
+          rl[6:8].hex())
+    check("摇杆有符号小端：LY=32767 → FF 7F", rl[8] == 0xFF and rl[9] == 0x7F,
+          rl[8:10].hex())
+    check("摇杆有符号小端：RX=-1 → FF FF", rl[10] == 0xFF and rl[11] == 0xFF,
+          rl[10:12].hex())
+    check("摇杆越界被夹到 32767：RY=40000 → FF 7F", rl[12] == 0xFF and rl[13] == 0x7F,
+          rl[12:14].hex())
+
+    rc = xb.to_report((0, 300, -5, 0, 0, 0, 0))
+    check("扳机越界夹到 0..255", rc[4] == 255 and rc[5] == 0, rc[4:6].hex())
+
+    check("桥未启用时 current_report 返回 None（回落假半扣）",
+          xb.current_report(lambda k, d=0: 0) is None, "None")
+
+    # --- 9b. 槽位重扫不得阻塞读线程 ---
+    # 2026-11-21 实测事故：find_physical 内部要 sleep 0.8s 才能算出包速，
+    # 被放在读循环里 → 每 5 秒冻结输入 760ms（游戏里摇杆每 5 秒僵一下）。
+    # 这条用例把"重扫必须在独立线程"钉死：让 find_physical 故意慢 0.6s，
+    # 读次数仍须照常增长。改回内联重扫时这里会立刻掉到 0。
+    import time as _t
+    _orig_find = xb.find_physical
+
+    def _slow_find(probe_s=0.8):
+        _t.sleep(0.6)
+        return 0, {0: 100.0}
+
+    xb.find_physical = _slow_find
+    try:
+        bb = xb.Bridge(hz=200).start()
+        _t.sleep(1.5)                      # 首扫 0.6s 完成后应已接管
+        _n0 = bb.stats["reads"]
+        _t.sleep(0.8)                      # 这段里重扫线程不一定在跑，只验读线程不受影响
+        _n1 = bb.stats["reads"]
+        bb.stop()
+    finally:
+        xb.find_physical = _orig_find
+    check("槽位重扫不阻塞读线程（0.8s 内读次数仍增长 >50）", _n1 - _n0 > 50,
+          "%d → %d" % (_n0, _n1))
+
+    # --- 9c. 冷启动闸门：引擎还没开始发 0x57 帧之前，不得接管真输入 ---
+    # 2026-11-21 事故：冷启动时桥立刻接管真输入，而"没人碰手柄"的真输入是一份
+    # 恒定全零的报告；引擎 attach 时看到这个就不进流模式，frames 从此为 0。
+    # 热切换没事（引擎已在流）。所以闸门必须是"先假半扣，看到引擎发帧再接管"。
+    _orig_cr = xb.current_report
+    xb.current_report = lambda cfg: b"\x00\x14" + bytes(18)
+    _save_seen = new._ENGINE_SEEN
+    _save_n = new._STATS["n"]
+    try:
+        obj = object.__new__(new.Apex6Virtual)      # 只测方法，不建整套设备
+        new._ENGINE_SEEN = False
+        new._STATS["n"] = 0
+        check("引擎未发帧时桥不接管（回落假半扣）", obj._bridge_report() is None,
+              "None")
+        new._STATS["n"] = 51
+        _got = obj._bridge_report()
+        check("引擎开始发帧后桥接管真输入", _got == b"\x00\x14" + bytes(18),
+              (_got or b"").hex())
+        new._STATS["n"] = 0
+        _still = obj._bridge_report()
+        check("接管后即使帧计数回退也不回退（防振荡）",
+              _still == b"\x00\x14" + bytes(18), (_still or b"").hex())
+    finally:
+        xb.current_report = _orig_cr
+        new._ENGINE_SEEN = _save_seen
+        new._STATS["n"] = _save_n
+
+    # --- 9d. 静止保活：引擎约 10 秒收不到输入变化就停流，桥必须自己打脉冲 ---
+    _b = xb.Bridge(hz=500, idle_kick_ms=250, kick_lt=40, idle_after_ms=0)
+    _b._slot = 0
+    _b._snap = (0x0000, 0, 0, 100, -50, 0, 0)      # 轻微漂移，仍算松手
+    _lxs, _t0 = set(), _t.time()
+    while _t.time() - _t0 < 0.9:
+        _r = _b.report()
+        _lxs.add(int.from_bytes(_r[6:8], "little", signed=True))
+        _t.sleep(0.01)
+    # 注意：早期版本用 LX±1 做保活，实测**无效**（引擎只认扳机），已删掉这两条断言。
+    _rr = _b.report()
+    check("保活不动其它字段（LY 保持 -50）",
+          int.from_bytes(_rr[8:10], "little", signed=True) == -50, _rr[8:10].hex())
+
+    # 保活必须真的动扳机：引擎认的是 LT>=40，摇杆±1 / 保留字节 / LT=6 都不认
+    # （2026-11-21 四次冷启动实测：1359/1362/1347 帧后停流，只有 kick_lt=40 能维持）
+    _b2 = xb.Bridge(hz=500, idle_kick_ms=250, kick_lt=40, idle_after_ms=0)
+    _b2._slot = 0
+    _b2._snap = (0, 0, 0, 0, 0, 0, 0)
+    _lts, _t0 = set(), _t.time()
+    while _t.time() - _t0 < 0.9:
+        _lts.add(_b2.report()[4])
+        _t.sleep(0.01)
+    check("保活方波把 LT 顶到 kick_lt（引擎只认这个）", _lts == {0, 40}, "LT 取值 %s" % sorted(_lts))
+
+    _b3 = xb.Bridge(hz=500, idle_kick_ms=250, kick_lt=40, idle_after_ms=0)
+    _b3._slot = 0
+    _b3._snap = (0, 200, 0, 0, 0, 0, 0)      # 用户按住 LT 不放
+    _lts3, _t0 = set(), _t.time()
+    while _t.time() - _t0 < 0.9:
+        _lts3.add(_b3.report()[4])
+        _t.sleep(0.01)
+    check("按住 LT 时保活取最大值，不覆盖真值", _lts3 == {200}, "LT 取值 %s" % sorted(_lts3))
+
+    # 玩家只要还在操作，就绝不能伪造扳机——否则推着摇杆保持不动也会举枪
+    # （2026-11-21 实测：一轮采样里 slot1 有 1437 行 LT=40，物理只有 2 行）
+    for _label, _snap in (("推着摇杆不动", (0, 0, 0, 18000, 0, 0, 0)),
+                          ("按着 A 键不动", (0x1000, 0, 0, 0, 0, 0, 0)),
+                          ("按住 RT=255", (0, 0, 255, 0, 0, 0, 0))):
+        _bx = xb.Bridge(hz=500, idle_kick_ms=250, kick_lt=40, idle_after_ms=0)
+        _bx._slot = 0
+        _bx._snap = _snap
+        _seen, _t0 = set(), _t.time()
+        while _t.time() - _t0 < 0.6:
+            _seen.add(_bx.report()[4])
+            _t.sleep(0.01)
+        check("玩家在操作时不伪造扳机（%s）" % _label, 40 not in _seen,
+              "LT 取值 %s" % sorted(_seen))
 
     bad = [r for r in results if not r[1]]
     print("\n=== %d/%d PASS%s ===" % (len(results) - len(bad), len(results),
