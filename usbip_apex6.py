@@ -18,6 +18,7 @@ import atexit
 import ctypes
 import gc
 import json
+import math as _m
 import os
 import socket
 import struct
@@ -341,6 +342,16 @@ CFG = {
     "strength": 100,     # %，全局强度
     "boost_x": 2.0,      # 转子抬升倍率
     "boost_add": 55,     # 转子非零地板
+    # ---- D1 合并增益（2026-11-21 审计 §15，docs/audio-side-audit.md）----
+    # 旧两级增益（本函数的压缩曲线 + rumble 的 ×boost_x+boost_add）在输入 38% 满幅
+    # 就顶死 255，上半段动态全失。k5_rotor_gain=1 时握把(L/R)改走单级转子曲线
+    # （floor..255 幂曲线 + tanh 软限幅），rumble 不再放大；=0 回到旧两级（回滚开关，
+    # 热加载 1s 生效）。扳机(t)通道永远走旧曲线，不动 trig_force/trig_rattle 的标定。
+    "k5_rotor_gain": 0,  # 1=合并单级曲线（新），0=旧两级增益（回滚）
+    "k5_floor": 60,      # 转子起转高度 0..254：低于此转子不转（boost_add 地板的曲线版）
+    "k5_gamma": 0.6,     # 幂曲线指数：<1 中段更响，=1 线性，>1 中段更轻
+    "k5_knee": 215,      # 软限幅起点：高于此值 tanh 压缩渐近 255，替代 min(255) 硬裁
+    "k5_jump_bypass_merged": 40,  # 合并模式的抢发阈值（起手电平 66~95；旧模式用 k5_jump_bypass=70）
     "hold_ms": 140,      # 转子保持时间
     "trig_threshold": 12,    # 扳机通道 t 激活门限（i8 有符号值）
     "trig_hold_ms": 300,     # t 归零后扳机效果保持时长
@@ -362,7 +373,9 @@ CFG = {
                              # 震荡根因=释放住帧路径里的结构性 bug，修复后爆发可安全开启。
     # ---- 扳机力包络层（tf_*）：把 0x57 的 t 通道渲染成"阻尼力度" ----
     # 物理依据：k5 的扳机是力反馈电机（会顶手），不是音频马达（不会振）。
-    # 飞智那套 60/80/130Hz 载波对我们没意义，只有它的**包络**有意义。
+    # 【待复核 2026-11-21 审计 §4】下一行"载波没意义"与交接文档 §11 冲突：
+    # 官方扳机就是载波振动（60/80/130Hz、1ms 起手），mode 2 的 p3 即载波频率。
+    # 此处"只有包络有意义"是早期判断，验证前别当结论用。
     # 开启后 mode 2 机枪爆发自动让位（两者同时开会互相抢扳机）；mode 5 实测无响应，不用。
     # 独立实现见 trig_force.py；离线回归 test_trig_force.py。
     "tf_enable": 0,          # 1=启用（默认关）
@@ -521,10 +534,27 @@ def _stats_watcher():
                 pass
 
 
-def _level_from_rms(rms):
-    """RMS(0..127) -> k5 马达 0..255：门限 -> 软膝增益 -> 强度缩放"""
+def _level_from_rms(rms, rotor=False):
+    """RMS(0..127) -> k5 马达 0..255。
+
+    rotor=False（扳机 t 通道 + 回滚模式）：门限 -> 压缩曲线 -> 强度缩放，与旧版逐字节一致。
+    rotor=True 且 k5_rotor_gain=1（D1 合并模式）：单级转子曲线——
+      有效域归一 -> floor..255 幂曲线 -> 强度缩放 -> tanh 软限幅（渐近 255，不硬裁）。
+    一条链路只做一次增益（审计 D1）：合并模式下 rumble 的 ×boost_x+boost_add 被跳过。
+    """
     if rms < CFG["threshold"]:
         return 0
+    if rotor and CFG.get("k5_rotor_gain"):
+        thr = CFG["threshold"]
+        x = min(1.0, (rms - thr) / max(1.0, 127.0 - thr))
+        floor = min(254.0, max(0.0, float(CFG.get("k5_floor", 60))))
+        gamma = min(2.0, max(0.1, float(CFG.get("k5_gamma", 0.6))))
+        out = (floor + (255.0 - floor) * x ** gamma) * CFG["strength"] / 100.0
+        knee = min(254.0, max(1.0, float(CFG.get("k5_knee", 215))))
+        if out > knee:
+            out = knee + (255.0 - knee) * _m.tanh(
+                (out - knee) / max(1.0, 255.0 - knee))
+        return max(0, min(255, int(round(out))))
     x = rms / 127.0
     g = min(200, max(100, CFG["pcm_gain"]))
     # scaleApex6Pcm 归一化：out = 127*g*x/(100+(g-100)*x)，满幅 x=1 → 127
@@ -551,21 +581,31 @@ def decode_57(payload):
     def rms(vals):
         return (sum(v * v for v in vals) / len(vals)) ** 0.5
 
-    def lv1(vals):
+    def lv1(vals, rotor=False):
         """整包 RMS 给"稳"，最近两子帧给"快"。
 
         一个 0x57 包 = 8 子帧 = 64ms 音频。只取整包 RMS 时，打击的起手会被
         早先那几帧静音摊薄，听感上就是"慢半拍"。这里再算一次最后 16ms 的 RMS，
         只有它明显更大（起手瞬间）才采纳—— sustain 段不受影响，不会被系统性抬高。
         """
-        a = _level_from_rms(rms(vals))
+        a = _level_from_rms(rms(vals), rotor)
         if len(vals) >= 2:
-            b = _level_from_rms(rms(vals[-2:]))
-            if b > a * 1.15:
-                return b
+            if rotor and CFG.get("k5_rotor_gain"):
+                # 转子合并模式：瞬态判定固定在原始 RMS 域（rb > ra*1.15）。
+                # 转子曲线带 floor，映射后比值被压缩，1.15 若在映射域比较会漏判起手。
+                # （旧路径保持映射域比较 = 旧版逐字节一致，扳机标定不受影响）
+                ra, rb = rms(vals), rms(vals[-2:])
+                if rb > ra * 1.15:
+                    b = _level_from_rms(rb, rotor)
+                    if b > a:
+                        return b
+            else:
+                b = _level_from_rms(rms(vals[-2:]), rotor)
+                if b > a * 1.15:
+                    return b
         return a
 
-    return lv1(tv), lv1(lv), lv1(rv)
+    return lv1(tv), lv1(lv, True), lv1(rv, True)
 
 
 class K5:
@@ -833,7 +873,12 @@ class K5:
                 jump = max(abs(pend[5] - self._sent_level[0]),
                            abs(pend[6] - self._sent_level[1]))
             wait = hard_iv - (now - self._last_write_at)
-            allow_burst = jump >= CFG.get("k5_jump_bypass", 70)
+            # 抢发阈值跟模式走（D1，2026-11-21）：合并曲线的起手电平（66~95）比
+            # 旧两级（95~117）低，70 会漏掉近半起手 → 排队等令牌桶（实测中位 +10ms）。
+            # 旧模式保持 70 不动，关掉合并增益 = 完整旧行为。
+            burst_thr = (CFG.get("k5_jump_bypass_merged", 40) if CFG.get("k5_rotor_gain")
+                         else CFG.get("k5_jump_bypass", 70))
+            allow_burst = jump >= burst_thr
             if not allow_burst:
                 wait = max(wait, (1.0 - self._tokens) * min_iv)
             if wait > 0:
@@ -882,11 +927,16 @@ class K5:
                 low, high = self._last_nz[1], self._last_nz[2]
         else:
             self._last_nz = (now, low, high)
-        # 转子抬升：非零即加地板 + 线性放大
-        if low:
-            low = min(255, int(low * CFG["boost_x"] + CFG["boost_add"]))
-        if high:
-            high = min(255, int(high * CFG["boost_x"] + CFG["boost_add"]))
+        # 转子抬升：D1 合并模式（k5_rotor_gain=1）下，转子曲线已在 _level_from_rms
+        # 输出终值（floor..255 幂曲线+软限幅），本级不再放大——否则重回两级增益
+        # 38% 满幅顶死 255 的老路。=0 时保留旧二级增益（回滚开关）。
+        # 注意：XInput 直通路径（on_out ep1）在调用 rumble 前自带一次 boost，
+        # 合并模式下恰好变成单级（旧版这里是两级叠加，游戏轻震动也被顶到 255）。
+        if not CFG.get("k5_rotor_gain"):
+            if low:
+                low = min(255, int(low * CFG["boost_x"] + CFG["boost_add"]))
+            if high:
+                high = min(255, int(high * CFG["boost_x"] + CFG["boost_add"]))
         self.boosted_max = max(self.boosted_max, low, high)
         self._last_rumble_ts = now  # 流活性信号（去重前刷新，防误归零）
         # TTL 去重：写进程/设备状态失步时最多 TTL 秒就会强制重发一帧，自愈恢复震动

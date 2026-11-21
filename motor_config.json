@@ -1,8 +1,8 @@
 {
  "boost_x": 2.0,
- "boost_add": 71.0,
+ "boost_add": 71,
  "hold_ms": 140,
- "pcm_gain": 150,
+ "pcm_gain": 140,
  "threshold": 2.0,
  "strength": 100,
  "trig_threshold": 12,
@@ -10,7 +10,7 @@
  "trig_hold_ms": 300,
  "trig_push": 0,
  "rt_mode": "mirror",
- "k5_min_iv": 0.08,
+ "k5_min_iv": 0.03,
  "trig_burst": 1,
  "tf_enable": 0,
  "tf_base": 1,
@@ -40,5 +40,12 @@
  "tr_step": 12,
  "tr_min_iv_ms": 90,
  "tr_jump_bypass": 80,
- "tr_head_floor": 40
+ "tr_head_floor": 40,
+ "k5_hard_iv": 0.028,
+ "k5_jump_bypass": 70,
+ "k5_rotor_gain": 1,
+ "k5_floor": 60,
+ "k5_gamma": 0.6,
+ "k5_knee": 215,
+ "k5_jump_bypass_merged": 40
 }
