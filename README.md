@@ -5,13 +5,13 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f81f7?style=flat-square)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-2f81f7?style=flat-square)](requirements.txt)
 [![Windows 11 x64](https://img.shields.io/badge/platform-Windows%2011%20x64-2f81f7?style=flat-square)](#兼容与实测)
-[![160 offline tests](https://img.shields.io/badge/tests-158%20offline-3fb950?style=flat-square)](#测试)
+[![188 offline tests](https://img.shields.io/badge/tests-188%20offline-3fb950?style=flat-square)](#测试)
 [![USB/IP bridge](https://img.shields.io/badge/bridge-USB%2FIP-8957e5?style=flat-square)](#架构)
 
 > 把一个「只认自家手柄」的音频力反馈引擎，接到第三方手柄的马达和扳机上。
 > A USB/IP device impersonation bridge that translates a proprietary audio-haptics engine's output into another controller's motor/trigger frames.
 
-个人项目的工程存档：**逆向一个私有 USB 协议，然后用 158 条离线回归把它钉住**。
+个人项目的工程存档：**逆向一个私有 USB 协议，然后用 188 条离线回归把它钉住**。
 仓库里只有我自己写的代码——不含任何厂商二进制、配置包或反编译产物，见文末[免责声明](#免责声明)。
 
 **中文** · [English](#english)
@@ -40,7 +40,7 @@ local device accepts.
 
 **Status** — second generation; supersedes
 [`gamepad-haptic-trigger-vibration-research`](https://github.com/senxppp/gamepad-haptic-trigger-vibration-research).
-158 offline regression tests (4 more need reference baselines and are skipped); live-validated on one controller over USB.
+188 offline regression tests (4 more run with local reference baselines and are skipped in the repo); live-validated on one controller over USB.
 
 **Compatibility** — Flydigi Apex 5 (k5) over USB, engine 5.0.2.8, Windows 11 x64. Wireless mode,
 other controller models and other engine versions are untested: the `0x57` frame layout and the
@@ -101,7 +101,7 @@ you use. Run at your own risk.
 | 我们负责 | 全链路（抓音 → 特征 → 映射 → 输出） | 只做**设备间翻译** + **稳定性** |
 | 接入方式 | 私有 HID 直发马达（`0xFFA0`） | USB/IP 虚拟设备，截引擎的 `0x57` 流 |
 | 适用硬件 | 上一代手柄 + DS 模式 | 新一代手柄 dongle |
-| 稳定性投入 | 基本没有 | 节流 / 停帧自愈 / 热插拔守护 / 158 条回归 |
+| 稳定性投入 | 基本没有 | 节流 / 停帧自愈 / 热插拔守护 / 188 条回归 |
 
 换成"让厂商引擎解析"不是退让：它的频段权重、瞬态检测、头/身/锁时序是调过的，
 自己重写一遍要花几个月还不如它。**把力气留在它不做的那部分**——翻译准、别卡死、别掉线。
@@ -303,7 +303,8 @@ m1 p0,0  ← 释放
 | `tf_enable` | 0 | 阻尼层（"顶手"）开关 |
 | `mute.flag` | — | 存在即静音（界面「暂停震动」写它），服务端每秒检查 |
 | `cmd.txt` | — | 一次性命令：`zero` / `buzz`，取走即删 |
-| `k5_min_iv` | 0.08 | 硬件写入最小间隔（12.5 写/s） |
+| `k5_min_iv` | 0.03 | 硬件写入最小间隔（令牌桶长期上限 33 写/s，实际受音频驱动） |
+| `k5_rotor_gain` | 1 | D1 合并增益开关（0 = 回滚旧两级增益，1s 热加载） |
 
 ## 测试
 
@@ -315,15 +316,16 @@ for t in test_*.py; do python -I "$t"; done
 
 | 套件 | 条数 | 覆盖 |
 |---|---|---|
-| `test_vibe_chain.py` | 20（+4 SKIP） | 协议帧构造、0x57 解析、stats 格式串 |
+| `test_vibe_chain.py` | 21（+4 SKIP） | 协议帧构造、0x57 解析、stats 格式串 |
 | `test_hotplug.py` | 28 | 去抖 / 稳定期 / 冷却 / 自我触发排除 |
-| `test_frame_guard.py` | 32 | 停帧判定、来源选择、退避 |
+| `test_frame_guard.py` | 33 | 停帧判定、来源选择、退避 |
 | `test_trigger_fallback.py` | 18 | 扳机回落（残响帧 / 队列插队 / 参数下限） |
 | `test_trig_force.py` | 27 | 包络 → 力、量化、写闸 |
 | `test_trig_rattle.py` | 25 | 头/身/锁时序、预算 |
 | `test_trig_wire.py` | 8 | **接线**：喂真 0x57 帧，断言"打击后不许立刻 rest" |
-| `test_drift.py` | 9 | **引用完整性**：所有被 spawn / `python -I` 拉起的脚本是否真在仓库里 |
-| **合计** | **167** | 158 条业务回归 + 9 条仓库自洽 |
+| `test_rotor_gain.py` | 16 | **D1 增益曲线**：legacy/merged 钉值表、单调与软限幅上界、t 通道分离、瞬态原始域判别体、rumble 门控 |
+| `test_drift.py` | 12 | **引用完整性**：所有被 spawn / `python -I` 拉起的脚本是否真在仓库里 |
+| **合计** | **188** | 176 条业务回归 + 12 条仓库自洽（开发目录带本地基准跑满 192） |
 
 > `test_vibe_chain.py` 里有 4 条需要历史版本源码做逐字节对照（"永久不震"bug 复现、
 > 节流相位回归、三类帧的零回归）。那两份基准含本机绝对路径，不随仓库发布，
